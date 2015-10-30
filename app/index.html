@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en" ng-app="phonecatApp">
+<head>
+  <meta charset="utf-8">
+  <title>My HTML File</title>
+  <link rel="stylesheet" href="bower_components/bootstrap/dist/css/bootstrap.css">
+  <link rel="stylesheet" href="css/app.css">
+  <script src="bower_components/angular/angular.js"></script>
+  <script src="bower_components/angular/angular.js"></script>
+  <script src="js/app.js"></script>
+  <script src="js/controllers.js"></script>
+
+</head>
+<body ng-controller="CourseListCtrl">
+<ul>
+  <li><a href="#/">home</a></li>
+  <li><a href="#/about">about</a></li>
+  <li><a href="#/contact">contact</a></li>
+</ul>
+		<div>
+    <ng-view></ng-view>
+      <h1>{{title}}</h1>
+      <input type="text" ng-model="query">
+        <ul>
+          <li ng-repeat="phone in phones ">
+            <span>{{phone.name}}</span>
+            <p>{{phone.snippet}}</p>
+            <p>Status: {{phone.status}}</p>
+          </li>
+        </ul>
+        <p>Oбщее количетсво телефонов {{phones.length}}</p>
+      <!--  <p> {{today | date:'dd/MM/yyyy'}} </p>
+        {{'test string 8888' | limitTo:10 | uppercase}} -->
+    </div>
+   <!--  limiTo:3 - сокращает массив до указаного числа элементов (3) или для работы со строкой -->
+   <!-- oderBy - фильтрует по полю или значению -->
+  <!--  <li ng-repeat="phone in phones | filter:{name:query, status:false}"> -->
+
+<!--   сортировка по имени
+  <tr ng-repeat="phone in phones | orderBy:sortField"><td>{{phone.name}}</td></tr>
+  $scope.sortField="name"; -->
+
+<!-- УНИВЕРСАЛЬНАЯ СОРТИРОВКА
+
+<tr><th><a href="" ng-click="sort('name')">Name</a></th></tr>
+    </thead>
+    <tbody>
+      <tr ng-repeat="phone in phones | orderBy:sortField:reverse"><td>{{phone.name}}</td></tr>
+
+
+  $scope.sortField=undefined;
+    $scope.reverse=false;
+
+    $scope.sort = function(fieldName){
+      if($scope.sortField === fieldName){
+        $scope.reverse = !$scope.reverse;
+      } else{
+        $scope.sortField = fieldName;
+        $scope.reverse = false;
+      }
+    };
+ -->
+  <!-- <table>
+    <thead>
+      <tr><th><a href="" ng-click="sort('name')">Name</a></th></tr>
+    </thead>
+    <tbody>
+      <tr ng-repeat="phone in phones | orderBy:sortField:reverse"><td>{{phone.name}}</td></tr>
+    </tbody>
+  </table> -->
+</body>
+</html>
