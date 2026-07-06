@@ -1,8 +1,29 @@
-logs/*
-!.gitkeep
-node_modules/
-tmp
-.idea
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Project data (videos, clips, database)
+data/
+exports/
+*.db
+*.sqlite3
+
+# Secrets
+.env
+*.pem
+client_secret*.json
+token*.json
+
+# OS / editors
 .DS_Store
-angular-phonecat-snapshots
-bower_components/
+.idea/
+.vscode/
