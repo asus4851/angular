@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block title %}Огляд — ClipFactory{% endblock %}
+{% block content %}
+<h1>Огляд</h1>
+
+<div class="cards">
+  <div class="card"><div class="value">{{ stats.channels }}</div><div class="label">Канали</div></div>
+  <div class="card"><div class="value">{{ stats.videos }}</div><div class="label">Відео</div></div>
+  <div class="card"><div class="value">{{ stats.candidates_pending }}</div><div class="label">Кандидати на модерації</div></div>
+  <div class="card"><div class="value">{{ stats.clips_rendered }}</div><div class="label">Кліпи відрендерені</div></div>
+  <div class="card"><div class="value">{{ stats.posts_published }}</div><div class="label">Публікації успішні</div></div>
+  <div class="card"><div class="value">{{ stats.posts_failed }}</div><div class="label">Публікації з помилкою</div></div>
+</div>
+
+<button id="poll-all-btn">Перевірити канали зараз</button>
+<span id="poll-all-result" class="muted"></span>
+
+<h2>Останні кандидати</h2>
+{% if recent_candidates %}
+<table>
+  <tr><th>Відео</th><th>Заголовок</th><th>Скор</th><th>Статус</th></tr>
+  {% for c in recent_candidates %}
+  <tr>
+    <td>#{{ c.video_id }}</td>
+    <td>{{ c.title or c.hook }}</td>
+    <td>{{ c.score }}</td>
+    <td><span class="badge {{ c.status.value }}">{{ c.status.value }}</span></td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<div class="empty">Ще немає кандидатів</div>
+{% endif %}
+
+<h2>Останні публікації</h2>
+{% if recent_posts %}
+<table>
+  <tr><th>Кліп</th><th>Маршрут</th><th>Статус</th><th>URL</th></tr>
+  {% for p in recent_posts %}
+  <tr>
+    <td>#{{ p.clip_id }}</td>
+    <td>#{{ p.route_id }}</td>
+    <td><span class="badge {{ p.status.value }}">{{ p.status.value }}</span></td>
+    <td>{% if p.external_url %}<a class="link" href="{{ p.external_url }}" target="_blank">посилання</a>{% endif %}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<div class="empty">Ще немає публікацій</div>
+{% endif %}
+
+<script>
+document.getElementById('poll-all-btn').addEventListener('click', async () => {
+  const btn = document.getElementById('poll-all-btn');
+  const out = document.getElementById('poll-all-result');
+  btn.disabled = true;
+  try {
+    const res = await fetch('/api/poll-all', { method: 'POST' });
+    const data = await res.json();
+    out.textContent = res.ok ? `Заплановано перевірок: ${data.enqueued}` : (data.detail || 'Помилка');
+  } catch (e) {
+    out.textContent = 'Помилка мережі';
+  } finally {
+    btn.disabled = false;
+  }
+});
+</script>
+{% endblock %}

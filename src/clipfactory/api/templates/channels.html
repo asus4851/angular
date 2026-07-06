@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block title %}Канали — ClipFactory{% endblock %}
+{% block content %}
+<h1>Канали</h1>
+
+<form class="inline-form" id="add-channel-form">
+  <label>URL каналу
+    <input type="text" name="url" placeholder="https://youtube.com/@channel" required style="min-width:260px">
+  </label>
+  <label class="checkbox-row" style="flex-direction: row;">
+    <input type="checkbox" name="auto_approve"> Авто-затвердження
+  </label>
+  <label>Інтервал перевірки (хв)
+    <input type="number" name="check_interval_min" value="30" min="5">
+  </label>
+  <label>Мін. скор
+    <input type="number" name="min_score" value="60" min="0" max="100">
+  </label>
+  <label>Макс. кліпів / відео
+    <input type="number" name="max_clips_per_video" value="3" min="1">
+  </label>
+  <label>Мова
+    <input type="text" name="language" placeholder="uk">
+  </label>
+  <button type="submit">Додати канал</button>
+</form>
+<div id="add-channel-error" class="muted"></div>
+
+<table>
+  <tr><th>Назва</th><th>ID</th><th>Увімкнено</th><th>Авто</th><th>Інтервал</th><th>Мін. скор</th><th></th></tr>
+  {% for c in channels %}
+  <tr>
+    <td>{{ c.title or "—" }}<div class="muted">{{ c.url }}</div></td>
+    <td>{{ c.yt_channel_id }}</td>
+    <td><span class="badge {{ 'ok' if c.enabled else 'off' }}">{{ 'так' if c.enabled else 'ні' }}</span></td>
+    <td>{{ 'так' if c.auto_approve else 'ні' }}</td>
+    <td>{{ c.check_interval_min }} хв</td>
+    <td>{{ c.min_score }}</td>
+    <td class="actions">
+      <button class="small secondary" onclick="toggleChannel({{ c.id }}, {{ (not c.enabled) | tojson }})">{{ 'Вимкнути' if c.enabled else 'Увімкнути' }}</button>
+      <button class="small secondary" onclick="pollChannel({{ c.id }})">Перевірити</button>
+      <button class="small danger" onclick="deleteChannel({{ c.id }})">Видалити</button>
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="7" class="empty">Немає каналів</td></tr>
+  {% endfor %}
+</table>
+
+<script>
+document.getElementById('add-channel-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  const data = {
+    url: form.url.value,
+    auto_approve: form.auto_approve.checked,
+    check_interval_min: parseInt(form.check_interval_min.value, 10),
+    min_score: parseInt(form.min_score.value, 10),
+    max_clips_per_video: parseInt(form.max_clips_per_video.value, 10),
+    language: form.language.value,
+  };
+  const res = await fetch('/api/channels', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  if (res.ok) {
+    location.reload();
+  } else {
+    const err = await res.json().catch(() => ({}));
+    document.getElementById('add-channel-error').textContent = err.detail || 'Помилка додавання каналу';
+  }
+});
+
+async function toggleChannel(id, enabled) {
+  await fetch(`/api/channels/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  });
+  location.reload();
+}
+
+async function pollChannel(id) {
+  await fetch(`/api/channels/${id}/poll`, { method: 'POST' });
+  alert('Перевірку заплановано');
+}
+
+async function deleteChannel(id) {
+  if (!confirm('Видалити канал?')) return;
+  await fetch(`/api/channels/${id}`, { method: 'DELETE' });
+  location.reload();
+}
+</script>
+{% endblock %}

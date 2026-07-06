@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Публікації — ClipFactory{% endblock %}
+{% block content %}
+<h1>Публікації</h1>
+
+{% if posts %}
+<table>
+  <tr><th>Кліп</th><th>Маршрут</th><th>Акаунт</th><th>Статус</th><th>URL / помилка</th><th></th></tr>
+  {% for p in posts %}
+  <tr id="post-{{ p.id }}">
+    <td>#{{ p.clip_id }}</td>
+    <td>#{{ p.route_id }}</td>
+    <td><span class="badge platform">{{ p.route.account.platform.value }}</span> {{ p.route.account.name }}</td>
+    <td><span class="badge {{ p.status.value }}">{{ p.status.value }}</span></td>
+    <td>
+      {% if p.external_url %}<a class="link" href="{{ p.external_url }}" target="_blank">посилання</a>{% endif %}
+      {% if p.error %}<div class="muted">{{ p.error }}</div>{% endif %}
+    </td>
+    <td>
+      {% if p.status.value == 'failed' %}
+      <button class="small secondary" onclick="retryPost({{ p.id }})">Повторити</button>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<div class="empty">Ще немає публікацій</div>
+{% endif %}
+
+<script>
+async function retryPost(id) {
+  const res = await fetch(`/api/posts/${id}/retry`, { method: 'POST' });
+  if (res.ok) {
+    location.reload();
+  } else {
+    const err = await res.json().catch(() => ({}));
+    alert(err.detail || 'Помилка повтору');
+  }
+}
+</script>
+{% endblock %}

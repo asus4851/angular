@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}Акаунти — ClipFactory{% endblock %}
+{% block content %}
+<h1>Акаунти</h1>
+
+<form class="inline-form" id="add-account-form">
+  <label>Платформа
+    <select name="platform" id="platform-select">
+      <option value="local">local</option>
+      <option value="youtube">youtube</option>
+      <option value="instagram">instagram</option>
+      <option value="tiktok">tiktok</option>
+    </select>
+  </label>
+  <label>Назва
+    <input type="text" name="name" required placeholder="my-account">
+  </label>
+  <label style="flex: 1; min-width: 280px;">Креденшели (JSON)
+    <textarea name="credentials" id="credentials-input" placeholder="{}"></textarea>
+  </label>
+  <button type="submit">Додати акаунт</button>
+</form>
+<div id="add-account-error" class="muted"></div>
+
+<table>
+  <tr><th>Платформа</th><th>Назва</th><th>Креденшели</th><th>Увімкнено</th><th></th></tr>
+  {% for a in accounts %}
+  <tr>
+    <td><span class="badge platform">{{ a.platform.value }}</span></td>
+    <td>{{ a.name }}</td>
+    <td>{{ 'задані' if a.credentials_encrypted else '—' }}</td>
+    <td><span class="badge {{ 'ok' if a.enabled else 'off' }}">{{ 'так' if a.enabled else 'ні' }}</span></td>
+    <td class="actions">
+      <button class="small secondary" onclick="toggleAccount({{ a.id }}, {{ (not a.enabled) | tojson }})">{{ 'Вимкнути' if a.enabled else 'Увімкнути' }}</button>
+      <button class="small danger" onclick="deleteAccount({{ a.id }})">Видалити</button>
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="5" class="empty">Немає акаунтів</td></tr>
+  {% endfor %}
+</table>
+
+<script>
+const PLACEHOLDERS = {
+  local: '{}\n// або: {"export_dir": "/path", "name": "test-account"}',
+  youtube: '{\n  "client_id": "...",\n  "client_secret": "...",\n  "refresh_token": "..."\n}',
+  instagram: '{\n  "access_token": "...",\n  "ig_user_id": "..."\n}',
+  tiktok: '{\n  "access_token": "...",\n  "privacy_level": "SELF_ONLY"\n}',
+};
+const select = document.getElementById('platform-select');
+const textarea = document.getElementById('credentials-input');
+function updatePlaceholder() { textarea.placeholder = PLACEHOLDERS[select.value] || '{}'; }
+select.addEventListener('change', updatePlaceholder);
+updatePlaceholder();
+
+document.getElementById('add-account-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  let credentials = null;
+  const raw = form.credentials.value.trim();
+  if (raw) {
+    try {
+      credentials = JSON.parse(raw);
+    } catch (err) {
+      document.getElementById('add-account-error').textContent = 'Некоректний JSON у креденшелах';
+      return;
+    }
+  }
+  const res = await fetch('/api/accounts', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ platform: form.platform.value, name: form.name.value, credentials }),
+  });
+  if (res.ok) {
+    location.reload();
+  } else {
+    const err = await res.json().catch(() => ({}));
+    document.getElementById('add-account-error').textContent = err.detail || 'Помилка додавання акаунта';
+  }
+});
+
+async function toggleAccount(id, enabled) {
+  await fetch(`/api/accounts/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  });
+  location.reload();
+}
+
+async function deleteAccount(id) {
+  if (!confirm('Видалити акаунт?')) return;
+  await fetch(`/api/accounts/${id}`, { method: 'DELETE' });
+  location.reload();
+}
+</script>
+{% endblock %}

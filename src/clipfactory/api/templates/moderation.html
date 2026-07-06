@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}Модерація — ClipFactory{% endblock %}
+{% block content %}
+<h1>Модерація</h1>
+
+{% if candidates %}
+<div class="grid-cards">
+  {% for c in candidates %}
+  <div class="candidate-card" id="candidate-{{ c.id }}">
+    <h3>{{ c.title or "Без назви" }}</h3>
+    <div class="meta">Скор: {{ c.score }} · {{ c.start_sec | round(1) }}s — {{ c.end_sec | round(1) }}s · відео #{{ c.video_id }}</div>
+    {% if c.hook %}<div class="muted">{{ c.hook }}</div>{% endif %}
+    {% if c.reason %}<div class="muted">{{ c.reason }}</div>{% endif %}
+    {% if c.clip and c.clip.status.value == 'rendered' %}
+    <video controls src="/media/clips/{{ c.clip.id }}"></video>
+    {% endif %}
+    <div class="actions">
+      <button class="small" onclick="approveCandidate({{ c.id }})">Затвердити</button>
+      <button class="small danger" onclick="rejectCandidate({{ c.id }})">Відхилити</button>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="empty">Черга модерації порожня</div>
+{% endif %}
+
+<script>
+async function approveCandidate(id) {
+  const res = await fetch(`/api/candidates/${id}/approve`, { method: 'POST' });
+  if (res.ok) {
+    document.getElementById(`candidate-${id}`).remove();
+  } else {
+    alert('Помилка затвердження');
+  }
+}
+
+async function rejectCandidate(id) {
+  const res = await fetch(`/api/candidates/${id}/reject`, { method: 'POST' });
+  if (res.ok) {
+    document.getElementById(`candidate-${id}`).remove();
+  } else {
+    alert('Помилка відхилення');
+  }
+}
+</script>
+{% endblock %}

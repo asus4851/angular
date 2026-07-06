@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}Маршрути — ClipFactory{% endblock %}
+{% block content %}
+<h1>Маршрути</h1>
+
+<form class="inline-form" id="add-route-form">
+  <label>Канал
+    <select name="channel_id" required>
+      {% for c in channels %}
+      <option value="{{ c.id }}">{{ c.title or c.yt_channel_id }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>Акаунт
+    <select name="account_id" required>
+      {% for a in accounts %}
+      <option value="{{ a.id }}">{{ a.platform.value }} / {{ a.name }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <button type="submit">Додати маршрут</button>
+</form>
+<div id="add-route-error" class="muted"></div>
+
+<table>
+  <tr><th>Канал</th><th>Акаунт</th><th>Увімкнено</th><th></th></tr>
+  {% for r in routes %}
+  <tr>
+    <td>{{ r.channel.title or r.channel.yt_channel_id }}</td>
+    <td><span class="badge platform">{{ r.account.platform.value }}</span> {{ r.account.name }}</td>
+    <td><span class="badge {{ 'ok' if r.enabled else 'off' }}">{{ 'так' if r.enabled else 'ні' }}</span></td>
+    <td class="actions">
+      <button class="small danger" onclick="deleteRoute({{ r.id }})">Видалити</button>
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="4" class="empty">Немає маршрутів</td></tr>
+  {% endfor %}
+</table>
+
+<script>
+document.getElementById('add-route-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  const res = await fetch('/api/routes', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      channel_id: parseInt(form.channel_id.value, 10),
+      account_id: parseInt(form.account_id.value, 10),
+    }),
+  });
+  if (res.ok) {
+    location.reload();
+  } else {
+    const err = await res.json().catch(() => ({}));
+    document.getElementById('add-route-error').textContent = err.detail || 'Помилка додавання маршруту';
+  }
+});
+
+async function deleteRoute(id) {
+  if (!confirm('Видалити маршрут?')) return;
+  await fetch(`/api/routes/${id}`, { method: 'DELETE' });
+  location.reload();
+}
+</script>
+{% endblock %}
