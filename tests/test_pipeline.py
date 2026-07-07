@@ -24,9 +24,8 @@ from clipfactory.models import (
     Video,
     VideoStatus,
 )
-from clipfactory.pipeline import approve_candidate, drain_queue, enqueue
+from clipfactory.pipeline import approve_candidate, drain_queue, enqueue, stages
 from clipfactory.pipeline import queue as pipeline_queue
-from clipfactory.pipeline import stages
 from clipfactory.publish import PublishError
 from clipfactory.schemas import Moment, TranscriptSegment
 from clipfactory.transcripts import youtube as transcripts_yt

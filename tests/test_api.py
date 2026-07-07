@@ -17,7 +17,6 @@ from clipfactory.models import (
     Job,
     JobType,
     Platform,
-    Route,
     Video,
     VideoStatus,
 )

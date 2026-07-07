@@ -18,8 +18,8 @@ from sqlalchemy import func
 
 from clipfactory import crypto
 from clipfactory.config import get_settings
-from clipfactory.ingest import youtube as ingest_yt
 from clipfactory.db import init_db, session_scope
+from clipfactory.ingest import youtube as ingest_yt
 from clipfactory.models import (
     Account,
     CandidateStatus,

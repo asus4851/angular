@@ -7,7 +7,17 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from clipfactory.api.routers import accounts, candidates, channels, clips, dashboard, media, posts, routes, videos
+from clipfactory.api.routers import (
+    accounts,
+    candidates,
+    channels,
+    clips,
+    dashboard,
+    media,
+    posts,
+    routes,
+    videos,
+)
 from clipfactory.config import get_settings
 from clipfactory.db import init_db
 
