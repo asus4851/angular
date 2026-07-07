@@ -11,6 +11,7 @@ import logging
 import re
 import xml.etree.ElementTree as ET
 from datetime import UTC, datetime
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 from sqlalchemy.orm import Session
@@ -21,6 +22,7 @@ from clipfactory.schemas import ChannelInfo, VideoInfo
 logger = logging.getLogger(__name__)
 
 _CHANNEL_ID_RE = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
+_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
 _ATOM_NS = "http://www.w3.org/2005/Atom"
 _YT_NS = "http://www.youtube.com/xml/schemas/2015"
@@ -73,6 +75,127 @@ def _to_naive_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt
     return dt.astimezone(UTC).replace(tzinfo=None)
+
+
+def _ydl_opts(**overrides: object) -> dict:
+    """Base options for a quiet, no-download YoutubeDL instance."""
+    opts: dict = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+    }
+    opts.update(overrides)
+    return opts
+
+
+def parse_video_id(url_or_id: str) -> str | None:
+    """Extract an 11-char YouTube video id from any known URL form, or a bare id."""
+    candidate = url_or_id.strip()
+    if _VIDEO_ID_RE.match(candidate):
+        return candidate
+
+    parsed = urlparse(candidate if "//" in candidate else f"//{candidate}")
+    host = (parsed.netloc or "").lower()
+    path = parsed.path or ""
+
+    if "youtu.be" in host:
+        vid = path.strip("/").split("/")[0]
+        return vid if _VIDEO_ID_RE.match(vid) else None
+
+    if "youtube.com" in host or "youtube-nocookie.com" in host:
+        if path == "/watch":
+            vid = parse_qs(parsed.query).get("v", [None])[0]
+            return vid if vid and _VIDEO_ID_RE.match(vid) else None
+        for prefix in ("/shorts/", "/live/", "/embed/"):
+            if path.startswith(prefix):
+                vid = path[len(prefix):].strip("/").split("/")[0]
+                return vid if _VIDEO_ID_RE.match(vid) else None
+
+    return None
+
+
+def fetch_video_info(url_or_id: str) -> tuple[VideoInfo, ChannelInfo]:
+    """Resolve a single video (any URL form or bare id) plus its owning channel."""
+    candidate = url_or_id.strip()
+    video_id = parse_video_id(candidate)
+    if video_id:
+        url = f"https://www.youtube.com/watch?v={video_id}"
+    else:
+        url = candidate
+
+    try:
+        import yt_dlp
+
+        with yt_dlp.YoutubeDL(_ydl_opts()) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as exc:  # yt_dlp raises its own DownloadError subclasses
+        raise IngestError(f"Failed to fetch video info from {url_or_id!r}: {exc}") from exc
+
+    if not isinstance(info, dict):
+        raise IngestError(f"Failed to fetch video info from {url_or_id!r}: no data returned")
+
+    channel_id = info.get("channel_id")
+    if not channel_id:
+        raise IngestError(f"Could not determine channel id for video {url_or_id!r}")
+
+    published_at = None
+    timestamp = info.get("timestamp")
+    if timestamp is not None:
+        try:
+            published_at = _to_naive_utc(datetime.fromtimestamp(timestamp, tz=UTC))
+        except (OverflowError, OSError, ValueError):
+            published_at = None
+    else:
+        upload_date = info.get("upload_date")
+        if upload_date:
+            try:
+                published_at = datetime.strptime(upload_date, "%Y%m%d")
+            except ValueError:
+                published_at = None
+
+    video_info = VideoInfo(
+        yt_video_id=info.get("id") or video_id or "",
+        title=info.get("title") or "",
+        url=info.get("webpage_url") or url,
+        duration_sec=info.get("duration"),
+        published_at=published_at,
+    )
+    channel_info = ChannelInfo(
+        yt_channel_id=channel_id,
+        title=info.get("channel") or info.get("uploader") or "",
+        url=info.get("channel_url") or f"https://www.youtube.com/channel/{channel_id}",
+    )
+    return video_info, channel_info
+
+
+def list_channel_videos(yt_channel_id: str, limit: int = 30) -> list[VideoInfo]:
+    """List up to `limit` videos on a channel's Videos tab (flat, no per-video metadata)."""
+    url = f"https://www.youtube.com/channel/{yt_channel_id}/videos"
+    try:
+        import yt_dlp
+
+        opts = _ydl_opts(extract_flat="in_playlist", playlistend=limit)
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as exc:  # yt_dlp raises its own DownloadError subclasses
+        raise IngestError(f"Failed to list videos for channel {yt_channel_id!r}: {exc}") from exc
+
+    entries = (info or {}).get("entries") or []
+    videos: list[VideoInfo] = []
+    for entry in entries:
+        if not entry or not entry.get("id"):
+            continue
+        video_id = entry["id"]
+        videos.append(
+            VideoInfo(
+                yt_video_id=video_id,
+                title=entry.get("title") or "",
+                url=entry.get("url") or entry.get("webpage_url") or f"https://www.youtube.com/watch?v={video_id}",
+                duration_sec=entry.get("duration"),
+                published_at=None,
+            )
+        )
+    return videos
 
 
 def fetch_recent_videos(yt_channel_id: str) -> list[VideoInfo]:

@@ -10,9 +10,14 @@ from clipfactory.ingest.youtube import (
     IngestError,
     discover_new_videos,
     fetch_recent_videos,
+    fetch_video_info,
+    list_channel_videos,
+    parse_video_id,
     resolve_channel,
 )
 from clipfactory.models import Channel, Video, VideoStatus
+
+SAMPLE_VIDEO_ID = "dQw4w9WgXcQ"
 
 SAMPLE_CHANNEL_ID = "UC_x5XG1OV2P6uZZ5FSM9Ttw"
 
@@ -155,3 +160,168 @@ def test_discover_new_videos_skips_existing_and_old(monkeypatch, db):
     with db() as session:
         all_ids = {row[0] for row in session.query(Video.yt_video_id).all()}
         assert all_ids == {"vid_existing", "vid_new", "vid_no_date"}
+
+
+# --- parse_video_id -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "url_or_id",
+    [
+        f"https://www.youtube.com/watch?v={SAMPLE_VIDEO_ID}",
+        f"https://www.youtube.com/watch?v={SAMPLE_VIDEO_ID}&t=30s",
+        f"https://youtu.be/{SAMPLE_VIDEO_ID}",
+        f"https://www.youtube.com/shorts/{SAMPLE_VIDEO_ID}",
+        f"https://www.youtube.com/live/{SAMPLE_VIDEO_ID}",
+        f"https://www.youtube.com/embed/{SAMPLE_VIDEO_ID}",
+        SAMPLE_VIDEO_ID,
+    ],
+)
+def test_parse_video_id_accepts_known_forms(url_or_id):
+    assert parse_video_id(url_or_id) == SAMPLE_VIDEO_ID
+
+
+@pytest.mark.parametrize(
+    "garbage",
+    [
+        "not a url",
+        "https://example.com/watch?v=short",
+        "https://www.youtube.com/watch",
+        "",
+        "too-long-to-be-a-video-id",
+    ],
+)
+def test_parse_video_id_returns_none_for_garbage(garbage):
+    assert parse_video_id(garbage) is None
+
+
+# --- fetch_video_info -------------------------------------------------------
+
+
+class _FakeYoutubeDL:
+    """Minimal stand-in for yt_dlp.YoutubeDL used across ingest tests."""
+
+    captured_opts: list[dict] | None = None
+    result: dict | None = None
+    exc: Exception | None = None
+
+    def __init__(self, opts):
+        if self.__class__.captured_opts is not None:
+            self.__class__.captured_opts.append(opts)
+        self.opts = opts
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def extract_info(self, url, download=False):
+        if self.__class__.exc is not None:
+            raise self.__class__.exc
+        return self.__class__.result
+
+
+def _install_fake_ydl(monkeypatch, result=None, exc=None, captured_opts=None):
+    fake_cls = type(
+        "_FakeYoutubeDLInstance",
+        (_FakeYoutubeDL,),
+        {"result": result, "exc": exc, "captured_opts": captured_opts},
+    )
+    monkeypatch.setattr("yt_dlp.YoutubeDL", fake_cls)
+    return fake_cls
+
+
+def test_fetch_video_info_via_upload_date(monkeypatch):
+    info = {
+        "id": SAMPLE_VIDEO_ID,
+        "title": "Test Video",
+        "webpage_url": f"https://www.youtube.com/watch?v={SAMPLE_VIDEO_ID}",
+        "duration": 212.0,
+        "channel_id": SAMPLE_CHANNEL_ID,
+        "channel": "Sample Channel",
+        "channel_url": f"https://www.youtube.com/channel/{SAMPLE_CHANNEL_ID}",
+        "upload_date": "20260615",
+    }
+    _install_fake_ydl(monkeypatch, result=info)
+
+    video, channel = fetch_video_info(f"https://www.youtube.com/watch?v={SAMPLE_VIDEO_ID}")
+
+    assert video.yt_video_id == SAMPLE_VIDEO_ID
+    assert video.title == "Test Video"
+    assert video.duration_sec == 212.0
+    assert video.published_at == datetime(2026, 6, 15)
+    assert channel.yt_channel_id == SAMPLE_CHANNEL_ID
+    assert channel.title == "Sample Channel"
+    assert channel.url == f"https://www.youtube.com/channel/{SAMPLE_CHANNEL_ID}"
+
+
+def test_fetch_video_info_via_timestamp(monkeypatch):
+    info = {
+        "id": SAMPLE_VIDEO_ID,
+        "title": "Test Video",
+        "webpage_url": f"https://www.youtube.com/watch?v={SAMPLE_VIDEO_ID}",
+        "duration": 212.0,
+        "channel_id": SAMPLE_CHANNEL_ID,
+        "channel": "Sample Channel",
+        "timestamp": 1750000000,  # 2025-06-15T14:13:20Z
+    }
+    _install_fake_ydl(monkeypatch, result=info)
+
+    video, channel = fetch_video_info(SAMPLE_VIDEO_ID)
+
+    assert video.published_at is not None
+    assert video.published_at.tzinfo is None
+    assert video.published_at == datetime.utcfromtimestamp(1750000000)
+    assert channel.yt_channel_id == SAMPLE_CHANNEL_ID
+
+
+def test_fetch_video_info_missing_channel_id_raises(monkeypatch):
+    info = {
+        "id": SAMPLE_VIDEO_ID,
+        "title": "Test Video",
+    }
+    _install_fake_ydl(monkeypatch, result=info)
+
+    with pytest.raises(IngestError):
+        fetch_video_info(SAMPLE_VIDEO_ID)
+
+
+def test_fetch_video_info_wraps_extraction_failure(monkeypatch):
+    _install_fake_ydl(monkeypatch, exc=RuntimeError("network down"))
+
+    with pytest.raises(IngestError):
+        fetch_video_info(SAMPLE_VIDEO_ID)
+
+
+# --- list_channel_videos -----------------------------------------------------
+
+
+def test_list_channel_videos_filters_missing_id_and_respects_limit(monkeypatch):
+    entries = [
+        {"id": "vid_one", "title": "One", "duration": 10.0, "url": "https://www.youtube.com/watch?v=vid_one"},
+        {"id": None, "title": "No id, should be skipped"},
+        {"title": "Missing id key entirely"},
+        {"id": "vid_two", "title": "Two"},
+    ]
+    captured_opts: list[dict] = []
+    _install_fake_ydl(monkeypatch, result={"entries": entries}, captured_opts=captured_opts)
+
+    videos = list_channel_videos(SAMPLE_CHANNEL_ID, limit=7)
+
+    assert [v.yt_video_id for v in videos] == ["vid_one", "vid_two"]
+    assert videos[0].title == "One"
+    assert videos[0].duration_sec == 10.0
+    assert videos[0].published_at is None
+    assert videos[1].url == "https://www.youtube.com/watch?v=vid_two"
+
+    assert len(captured_opts) == 1
+    assert captured_opts[0]["playlistend"] == 7
+    assert captured_opts[0]["extract_flat"] == "in_playlist"
+
+
+def test_list_channel_videos_wraps_extraction_failure(monkeypatch):
+    _install_fake_ydl(monkeypatch, exc=RuntimeError("boom"))
+
+    with pytest.raises(IngestError):
+        list_channel_videos(SAMPLE_CHANNEL_ID)
