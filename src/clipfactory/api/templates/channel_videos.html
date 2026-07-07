@@ -1,0 +1,108 @@
+{% extends "base.html" %}
+{% block title %}Відео каналу — ClipFactory{% endblock %}
+{% block content %}
+<h1>Відео каналу: {{ channel.title or channel.yt_channel_id }}</h1>
+<p><a class="link" href="/channels">← Назад до каналів</a></p>
+
+<form class="inline-form" onsubmit="return false;">
+  <label>Макс. кліпів (для імпорту)
+    <input type="number" id="max_clips" min="1" placeholder="за замовч.">
+  </label>
+  <label>Мін. скор (для імпорту)
+    <input type="number" id="min_score" min="0" max="100" placeholder="за замовч.">
+  </label>
+</form>
+
+<div id="catalog-error" class="muted"></div>
+<table>
+  <thead>
+    <tr><th>Назва</th><th>Тривалість</th><th>Статус</th><th></th></tr>
+  </thead>
+  <tbody id="catalog-body">
+    <tr><td colspan="4" class="empty">Завантаження…</td></tr>
+  </tbody>
+</table>
+
+<script>
+const channelId = {{ channel.id }};
+
+function fmtDuration(sec) {
+  if (sec === null || sec === undefined) return "—";
+  const m = Math.floor(sec / 60);
+  const s = Math.floor(sec % 60).toString().padStart(2, '0');
+  return `${m}:${s}`;
+}
+
+async function loadCatalog() {
+  const body = document.getElementById('catalog-body');
+  const errorBox = document.getElementById('catalog-error');
+  errorBox.textContent = '';
+  body.innerHTML = '<tr><td colspan="4" class="empty">Завантаження…</td></tr>';
+
+  let res;
+  try {
+    res = await fetch(`/api/channels/${channelId}/catalog`);
+  } catch (e) {
+    errorBox.textContent = 'Помилка мережі';
+    body.innerHTML = '';
+    return;
+  }
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    errorBox.textContent = err.detail || 'Не вдалося завантажити список відео каналу';
+    body.innerHTML = '';
+    return;
+  }
+  const items = await res.json();
+  body.innerHTML = '';
+  if (items.length === 0) {
+    body.innerHTML = '<tr><td colspan="4" class="empty">Відео не знайдено</td></tr>';
+    return;
+  }
+  for (const item of items) {
+    const tr = document.createElement('tr');
+    const badge = item.imported
+      ? '<span class="badge ok">імпортовано</span>'
+      : '<span class="badge off">не імпортовано</span>';
+    tr.innerHTML = `
+      <td></td>
+      <td>${fmtDuration(item.duration_sec)}</td>
+      <td>${badge}</td>
+      <td class="actions"></td>
+    `;
+    tr.children[0].textContent = item.title || "—";
+    if (!item.imported) {
+      const btn = document.createElement('button');
+      btn.className = 'small';
+      btn.textContent = 'Імпортувати й аналізувати';
+      btn.addEventListener('click', () => importVideo(item.yt_video_id, item.title, btn));
+      tr.querySelector('.actions').appendChild(btn);
+    }
+    body.appendChild(tr);
+  }
+}
+
+async function importVideo(ytVideoId, title, btn) {
+  btn.disabled = true;
+  const data = { yt_video_id: ytVideoId, title: title };
+  const maxClips = document.getElementById('max_clips').value;
+  const minScore = document.getElementById('min_score').value;
+  if (maxClips) data.max_clips = parseInt(maxClips, 10);
+  if (minScore) data.min_score = parseInt(minScore, 10);
+  const res = await fetch(`/api/channels/${channelId}/import`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  if (res.ok) {
+    loadCatalog();
+  } else {
+    const err = await res.json().catch(() => ({}));
+    alert(err.detail || 'Помилка імпорту відео');
+    btn.disabled = false;
+  }
+}
+
+loadCatalog();
+</script>
+{% endblock %}

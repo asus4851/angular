@@ -37,6 +37,7 @@
     <td>{{ c.check_interval_min }} хв</td>
     <td>{{ c.min_score }}</td>
     <td class="actions">
+      <a class="link" href="/channels/{{ c.id }}/videos">Відео каналу</a>
       <button class="small secondary" onclick="toggleChannel({{ c.id }}, {{ (not c.enabled) | tojson }})">{{ 'Вимкнути' if c.enabled else 'Увімкнути' }}</button>
       <button class="small secondary" onclick="pollChannel({{ c.id }})">Перевірити</button>
       <button class="small danger" onclick="deleteChannel({{ c.id }})">Видалити</button>

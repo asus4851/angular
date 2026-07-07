@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -16,6 +16,7 @@ from clipfactory.models import (
     Channel,
     Clip,
     ClipCandidate,
+    ClipStatus,
     Job,
     JobStatus,
     JobType,
@@ -91,6 +92,32 @@ def routes_page(request: Request, db: Session = Depends(get_db)):
     )
 
 
+@pages_router.get("/videos")
+def videos_page(request: Request, db: Session = Depends(get_db)):
+    videos = list(db.scalars(select(Video).order_by(Video.discovered_at.desc())))
+    channel_titles = {
+        c.id: (c.title or c.yt_channel_id) for c in db.scalars(select(Channel))
+    }
+    counts = dict(
+        db.execute(
+            select(ClipCandidate.video_id, func.count(ClipCandidate.id)).group_by(ClipCandidate.video_id)
+        ).all()
+    )
+    return templates.TemplateResponse(
+        request,
+        "videos.html",
+        {"videos": videos, "channel_titles": channel_titles, "candidate_counts": counts},
+    )
+
+
+@pages_router.get("/channels/{channel_id}/videos")
+def channel_videos_page(request: Request, channel_id: int, db: Session = Depends(get_db)):
+    channel = db.get(Channel, channel_id)
+    if channel is None:
+        raise HTTPException(status_code=404, detail="Channel not found")
+    return templates.TemplateResponse(request, "channel_videos.html", {"channel": channel})
+
+
 @pages_router.get("/moderation")
 def moderation_page(request: Request, db: Session = Depends(get_db)):
     candidates = list(
@@ -100,7 +127,16 @@ def moderation_page(request: Request, db: Session = Depends(get_db)):
             .order_by(ClipCandidate.created_at.desc())
         )
     )
-    return templates.TemplateResponse(request, "moderation.html", {"candidates": candidates})
+    accounts = list(db.scalars(select(Account).where(Account.enabled.is_(True)).order_by(Account.name)))
+    rendered_clips = list(
+        db.scalars(select(Clip).where(Clip.status == ClipStatus.RENDERED).order_by(Clip.rendered_at.desc()))
+    )
+    unpublished_clips = [c for c in rendered_clips if not c.posts]
+    return templates.TemplateResponse(
+        request,
+        "moderation.html",
+        {"candidates": candidates, "accounts": accounts, "unpublished_clips": unpublished_clips},
+    )
 
 
 @pages_router.get("/posts")

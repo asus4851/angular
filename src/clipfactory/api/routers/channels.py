@@ -1,14 +1,21 @@
-"""Channel CRUD + manual poll trigger."""
+"""Channel CRUD + manual poll trigger + video catalog browsing/import."""
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from clipfactory.api.deps import get_db
-from clipfactory.api.schemas import ChannelCreate, ChannelOut, ChannelUpdate
-from clipfactory.models import Channel
+from clipfactory.api.schemas import (
+    ChannelCatalogItem,
+    ChannelCreate,
+    ChannelImportOut,
+    ChannelImportRequest,
+    ChannelOut,
+    ChannelUpdate,
+)
+from clipfactory.models import Channel, Video, VideoStatus
 
 router = APIRouter(prefix="/api/channels", tags=["channels"])
 
@@ -79,3 +86,84 @@ def poll_channel(channel_id: int, db: Session = Depends(get_db)) -> dict:
     job = enqueue(db, JobType.POLL_CHANNEL, {"channel_id": channel.id})
     db.flush()
     return {"job_id": job.id}
+
+
+@router.get("/{channel_id}/catalog", response_model=list[ChannelCatalogItem])
+def channel_catalog(
+    channel_id: int, limit: int = Query(default=30, le=100), db: Session = Depends(get_db)
+) -> list[ChannelCatalogItem]:
+    channel = db.get(Channel, channel_id)
+    if channel is None:
+        raise HTTPException(status_code=404, detail="Channel not found")
+
+    from clipfactory.ingest.youtube import IngestError, list_channel_videos
+
+    try:
+        infos = list_channel_videos(channel.yt_channel_id, limit=limit)
+    except IngestError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    yt_ids = [info.yt_video_id for info in infos]
+    existing: dict[str, int] = {}
+    if yt_ids:
+        rows = db.execute(select(Video.yt_video_id, Video.id).where(Video.yt_video_id.in_(yt_ids))).all()
+        existing = dict(rows)
+
+    return [
+        ChannelCatalogItem(
+            yt_video_id=info.yt_video_id,
+            title=info.title,
+            duration_sec=info.duration_sec,
+            imported=info.yt_video_id in existing,
+            video_id=existing.get(info.yt_video_id),
+        )
+        for info in infos
+    ]
+
+
+@router.post("/{channel_id}/import", response_model=ChannelImportOut)
+def channel_import(
+    channel_id: int, payload: ChannelImportRequest, response: Response, db: Session = Depends(get_db)
+) -> ChannelImportOut:
+    channel = db.get(Channel, channel_id)
+    if channel is None:
+        raise HTTPException(status_code=404, detail="Channel not found")
+
+    from clipfactory.models import JobType
+    from clipfactory.pipeline.queue import enqueue
+
+    video = db.scalar(select(Video).where(Video.yt_video_id == payload.yt_video_id))
+    already_imported = False
+    needs_enqueue = True
+
+    if video is None:
+        video = Video(
+            channel_id=channel_id,
+            yt_video_id=payload.yt_video_id,
+            title=payload.title or "",
+            status=VideoStatus.NEW,
+        )
+        db.add(video)
+        db.flush()
+    elif video.status in (VideoStatus.SKIPPED, VideoStatus.FAILED):
+        video.status = VideoStatus.NEW
+        video.error = ""
+    else:
+        already_imported = True
+        needs_enqueue = False
+
+    if needs_enqueue:
+        job_payload: dict = {"video_id": video.id}
+        overrides: dict = {}
+        if payload.max_clips is not None:
+            overrides["max_clips"] = payload.max_clips
+        if payload.min_score is not None:
+            overrides["min_score"] = payload.min_score
+        if overrides:
+            job_payload["analysis_overrides"] = overrides
+        enqueue(db, JobType.FETCH_TRANSCRIPT, job_payload)
+        response.status_code = 201
+
+    db.flush()
+    db.refresh(video)
+    return ChannelImportOut(video_id=video.id, already_imported=already_imported)

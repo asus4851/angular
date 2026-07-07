@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from clipfactory.api.routers import accounts, candidates, channels, dashboard, media, posts, routes, videos
+from clipfactory.api.routers import accounts, candidates, channels, clips, dashboard, media, posts, routes, videos
 from clipfactory.config import get_settings
 from clipfactory.db import init_db
 
@@ -39,6 +39,7 @@ def create_app() -> FastAPI:
     app.include_router(routes.router)
     app.include_router(videos.router)
     app.include_router(candidates.router)
+    app.include_router(clips.router)
     app.include_router(posts.router)
     app.include_router(media.router)
     app.include_router(dashboard.api_router)

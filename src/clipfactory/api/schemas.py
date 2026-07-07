@@ -115,6 +115,63 @@ class VideoOut(BaseModel):
     candidate_count: int = 0
 
 
+class VideoImportRequest(BaseModel):
+    url: str
+    max_clips: int | None = None
+    min_score: int | None = None
+    language: str | None = None
+
+
+class VideoImportOut(BaseModel):
+    id: int
+    title: str
+    duration_sec: float | None = None
+    channel_title: str
+    already_imported: bool = False
+
+
+class VideoAnalyzeRequest(BaseModel):
+    max_clips: int | None = None
+    min_score: int | None = None
+    language: str | None = None
+
+
+class ChannelCatalogItem(BaseModel):
+    yt_video_id: str
+    title: str
+    duration_sec: float | None = None
+    imported: bool = False
+    video_id: int | None = None
+
+
+class ChannelImportRequest(BaseModel):
+    yt_video_id: str
+    title: str | None = None
+    max_clips: int | None = None
+    min_score: int | None = None
+
+
+class ChannelImportOut(BaseModel):
+    video_id: int
+    already_imported: bool = False
+
+
+class ApproveRequest(BaseModel):
+    account_ids: list[int] | None = None
+
+
+class ClipOut(BaseModel):
+    id: int
+    candidate_title: str
+    status: ClipStatus
+    duration_sec: float | None = None
+    has_posts: bool = False
+
+
+class ClipPublishRequest(BaseModel):
+    account_ids: list[int]
+
+
 class CandidateOut(BaseModel):
     id: int
     video_id: int

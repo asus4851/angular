@@ -14,6 +14,19 @@
     {% if c.clip and c.clip.status.value == 'rendered' %}
     <video controls src="/media/clips/{{ c.clip.id }}"></video>
     {% endif %}
+    {% if accounts %}
+    <details>
+      <summary class="muted">Куди опублікувати (необов'язково)</summary>
+      <div style="display:flex; flex-direction:column; gap:4px; margin-top:6px;">
+        {% for a in accounts %}
+        <label class="checkbox-row">
+          <input type="checkbox" class="account-pick" data-candidate="{{ c.id }}" value="{{ a.id }}">
+          {{ a.name }} ({{ a.platform.value }})
+        </label>
+        {% endfor %}
+      </div>
+    </details>
+    {% endif %}
     <div class="actions">
       <button class="small" onclick="approveCandidate({{ c.id }})">Затвердити</button>
       <button class="small danger" onclick="rejectCandidate({{ c.id }})">Відхилити</button>
@@ -25,9 +38,48 @@
 <div class="empty">Черга модерації порожня</div>
 {% endif %}
 
+<h2>Готові кліпи без публікацій</h2>
+{% if unpublished_clips %}
+<div class="grid-cards">
+  {% for clip in unpublished_clips %}
+  <div class="candidate-card" id="clip-{{ clip.id }}">
+    <h3>{{ clip.candidate.title or "Без назви" }}</h3>
+    <div class="meta">Кліп #{{ clip.id }}{% if clip.duration_sec %} · {{ clip.duration_sec | round(1) }}s{% endif %}</div>
+    <video controls src="/media/clips/{{ clip.id }}"></video>
+    {% if accounts %}
+    <details open>
+      <summary class="muted">Куди опублікувати</summary>
+      <div style="display:flex; flex-direction:column; gap:4px; margin-top:6px;">
+        {% for a in accounts %}
+        <label class="checkbox-row">
+          <input type="checkbox" class="clip-account-pick" data-clip="{{ clip.id }}" value="{{ a.id }}">
+          {{ a.name }} ({{ a.platform.value }})
+        </label>
+        {% endfor %}
+      </div>
+    </details>
+    {% else %}
+    <div class="muted">Немає увімкнених акаунтів для публікації</div>
+    {% endif %}
+    <div class="actions">
+      <button class="small" onclick="publishClip({{ clip.id }})">Опублікувати в акаунти</button>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="empty">Немає готових кліпів без публікацій</div>
+{% endif %}
+
 <script>
 async function approveCandidate(id) {
-  const res = await fetch(`/api/candidates/${id}/approve`, { method: 'POST' });
+  const checks = document.querySelectorAll(`.account-pick[data-candidate="${id}"]:checked`);
+  const account_ids = Array.from(checks).map(c => parseInt(c.value, 10));
+  const res = await fetch(`/api/candidates/${id}/approve`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ account_ids }),
+  });
   if (res.ok) {
     document.getElementById(`candidate-${id}`).remove();
   } else {
@@ -41,6 +93,26 @@ async function rejectCandidate(id) {
     document.getElementById(`candidate-${id}`).remove();
   } else {
     alert('Помилка відхилення');
+  }
+}
+
+async function publishClip(id) {
+  const checks = document.querySelectorAll(`.clip-account-pick[data-clip="${id}"]:checked`);
+  const account_ids = Array.from(checks).map(c => parseInt(c.value, 10));
+  if (account_ids.length === 0) {
+    alert('Оберіть хоча б один акаунт');
+    return;
+  }
+  const res = await fetch(`/api/clips/${id}/publish`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ account_ids }),
+  });
+  if (res.ok) {
+    document.getElementById(`clip-${id}`).remove();
+  } else {
+    const err = await res.json().catch(() => ({}));
+    alert(err.detail || 'Помилка публікації');
   }
 }
 </script>

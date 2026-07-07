@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block title %}Відео — ClipFactory{% endblock %}
+{% block content %}
+<h1>Відео</h1>
+
+<form class="inline-form" id="import-video-form">
+  <label>Додати відео за посиланням
+    <input type="text" name="url" placeholder="https://youtube.com/watch?v=..." required style="min-width:300px">
+  </label>
+  <label>Макс. кліпів
+    <input type="number" name="max_clips" min="1" placeholder="за замовч.">
+  </label>
+  <label>Мін. скор
+    <input type="number" name="min_score" min="0" max="100" placeholder="за замовч.">
+  </label>
+  <label>Мова
+    <input type="text" name="language" placeholder="uk">
+  </label>
+  <button type="submit">Додати відео</button>
+</form>
+<div id="import-video-error" class="muted"></div>
+
+<table>
+  <tr><th>Назва</th><th>Канал</th><th>Статус</th><th>Кандидатів</th><th>Опубліковано</th><th></th></tr>
+  {% for v in videos %}
+  <tr>
+    <td>{{ v.title or "—" }}</td>
+    <td>{{ channel_titles.get(v.channel_id, "—") }}</td>
+    <td><span class="badge {{ v.status.value }}">{{ v.status.value }}</span></td>
+    <td>{{ candidate_counts.get(v.id, 0) }}</td>
+    <td>{{ v.published_at.strftime('%Y-%m-%d') if v.published_at else "—" }}</td>
+    <td class="actions">
+      {% if v.status.value == 'analyzed' %}
+      <a class="link" href="/moderation?video_id={{ v.id }}">Модерація</a>
+      {% endif %}
+      {% if v.status.value in ('transcribed', 'analyzed') %}
+      <button class="small secondary" onclick="reanalyze({{ v.id }})">Аналізувати ще раз</button>
+      {% endif %}
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="6" class="empty">Немає відео</td></tr>
+  {% endfor %}
+</table>
+
+<script>
+document.getElementById('import-video-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  const data = { url: form.url.value };
+  if (form.max_clips.value) data.max_clips = parseInt(form.max_clips.value, 10);
+  if (form.min_score.value) data.min_score = parseInt(form.min_score.value, 10);
+  if (form.language.value) data.language = form.language.value;
+  const res = await fetch('/api/videos', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  if (res.ok) {
+    location.reload();
+  } else {
+    const err = await res.json().catch(() => ({}));
+    document.getElementById('import-video-error').textContent = err.detail || 'Помилка додавання відео';
+  }
+});
+
+async function reanalyze(id) {
+  const maxClips = prompt("Макс. кліпів (залиште порожнім, щоб не змінювати):", "");
+  if (maxClips === null) return;
+  const minScore = prompt("Мін. скор (залиште порожнім, щоб не змінювати):", "");
+  if (minScore === null) return;
+  const data = {};
+  if (maxClips.trim()) data.max_clips = parseInt(maxClips, 10);
+  if (minScore.trim()) data.min_score = parseInt(minScore, 10);
+  const res = await fetch(`/api/videos/${id}/analyze`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  if (res.ok) {
+    location.reload();
+  } else {
+    const err = await res.json().catch(() => ({}));
+    alert(err.detail || 'Помилка повторного аналізу');
+  }
+}
+</script>
+{% endblock %}

@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from clipfactory.api.deps import get_db
-from clipfactory.api.schemas import CandidateOut
+from clipfactory.api.schemas import ApproveRequest, CandidateOut
 from clipfactory.models import CandidateStatus, ClipCandidate, Video
 
 router = APIRouter(prefix="/api/candidates", tags=["candidates"])
@@ -59,14 +59,15 @@ def list_candidates(
 
 
 @router.post("/{candidate_id}/approve", response_model=CandidateOut)
-def approve(candidate_id: int, db: Session = Depends(get_db)) -> CandidateOut:
+def approve(candidate_id: int, payload: ApproveRequest | None = None, db: Session = Depends(get_db)) -> CandidateOut:
     candidate = db.get(ClipCandidate, candidate_id)
     if candidate is None:
         raise HTTPException(status_code=404, detail="Candidate not found")
 
     from clipfactory.pipeline import approve_candidate
 
-    approve_candidate(db, candidate)
+    account_ids = payload.account_ids if payload else None
+    approve_candidate(db, candidate, account_ids)
     db.flush()
     db.refresh(candidate)
     video = db.get(Video, candidate.video_id)
