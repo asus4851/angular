@@ -82,7 +82,10 @@ def handle_fetch_transcript(session: Session, payload: dict) -> None:
     video.status = VideoStatus.TRANSCRIBED
     video.error = ""
     session.flush()
-    queue.enqueue(session, JobType.ANALYZE_VIDEO, {"video_id": video.id})
+    analyze_payload: dict = {"video_id": video.id}
+    if payload.get("analysis_overrides"):
+        analyze_payload["overrides"] = payload["analysis_overrides"]
+    queue.enqueue(session, JobType.ANALYZE_VIDEO, analyze_payload)
 
 
 def handle_analyze_video(session: Session, payload: dict) -> None:
@@ -94,10 +97,11 @@ def handle_analyze_video(session: Session, payload: dict) -> None:
     transcript = video.transcript
     segments = transcripts_yt.segments_from_json(transcript.segments) if transcript else []
 
+    overrides = payload.get("overrides") or {}
     config = AnalysisConfig(
-        max_clips=channel.max_clips_per_video,
-        min_score=channel.min_score,
-        language=channel.language,
+        max_clips=overrides.get("max_clips", channel.max_clips_per_video),
+        min_score=overrides.get("min_score", channel.min_score),
+        language=overrides.get("language", channel.language),
     )
     analyzer = analysis.get_analyzer()
     moments = analyzer.find_moments(segments, video.title, config)
@@ -127,11 +131,15 @@ def handle_analyze_video(session: Session, payload: dict) -> None:
             approve_candidate(session, candidate)
 
 
-def approve_candidate(session: Session, candidate: ClipCandidate) -> None:
+def approve_candidate(
+    session: Session, candidate: ClipCandidate, account_ids: list[int] | None = None
+) -> None:
     """Approve a candidate, ensure its Clip row exists, and enqueue rendering.
 
     Shared by the analyze-video auto-approve path and manual moderation (CLI
-    `approve` command / the dashboard API).
+    `approve` command / the dashboard API). `account_ids` optionally adds
+    ad-hoc publish targets on top of the channel's routes; the posts are
+    created now and picked up for publishing once the clip is rendered.
     """
     candidate.status = CandidateStatus.APPROVED
     session.flush()
@@ -142,7 +150,37 @@ def approve_candidate(session: Session, candidate: ClipCandidate) -> None:
         session.add(clip)
         session.flush()
 
+    if account_ids:
+        publish_clip_to_accounts(session, clip, account_ids)
+
     queue.enqueue(session, JobType.RENDER_CLIP, {"candidate_id": candidate.id})
+
+
+def publish_clip_to_accounts(session: Session, clip: Clip, account_ids: list[int]) -> list[Post]:
+    """Create ad-hoc Posts targeting accounts directly (no route needed).
+
+    Publish jobs are enqueued immediately for an already-rendered clip;
+    otherwise handle_render_clip enqueues them after rendering.
+    """
+    from clipfactory.models import Account
+
+    posts = []
+    for account_id in dict.fromkeys(account_ids):
+        account = session.get(Account, account_id)
+        if account is None or not account.enabled:
+            logger.warning("publish_clip_to_accounts: skipping unknown/disabled account %s", account_id)
+            continue
+        post = (
+            session.query(Post).filter(Post.clip_id == clip.id, Post.account_id == account_id).one_or_none()
+        )
+        if post is None:
+            post = Post(clip_id=clip.id, account_id=account_id, status=PostStatus.PENDING)
+            session.add(post)
+            session.flush()
+        posts.append(post)
+        if clip.status == ClipStatus.RENDERED:
+            queue.enqueue(session, JobType.PUBLISH_POST, {"post_id": post.id})
+    return posts
 
 
 def handle_render_clip(session: Session, payload: dict) -> None:
@@ -226,6 +264,12 @@ def handle_render_clip(session: Session, payload: dict) -> None:
             session.flush()
         queue.enqueue(session, JobType.PUBLISH_POST, {"post_id": post.id})
 
+    # Ad-hoc posts created at approve time (direct account targets) wait for
+    # the render too — enqueue them now.
+    for post in clip.posts:
+        if post.route_id is None and post.status == PostStatus.PENDING:
+            queue.enqueue(session, JobType.PUBLISH_POST, {"post_id": post.id})
+
 
 class _SafeFormatter(Formatter):
     """A string.Formatter where missing/bad fields render as empty instead of raising."""
@@ -261,7 +305,11 @@ def handle_publish_post(session: Session, payload: dict) -> None:
         return
 
     route = post.route
-    account = route.account
+    account = post.target_account
+    if account is None:
+        post.status = PostStatus.FAILED
+        post.error = "post has neither a route nor an account target"
+        return
     clip = post.clip
     candidate = clip.candidate
     video = candidate.video
@@ -270,7 +318,11 @@ def handle_publish_post(session: Session, payload: dict) -> None:
     post.status = PostStatus.UPLOADING
     session.flush()
 
-    hashtags = list(dict.fromkeys([*candidate.hashtags, *route.extra_hashtags]))
+    extra_hashtags = route.extra_hashtags if route is not None else []
+    title_template = route.title_template if route is not None else "{title}"
+    description_template = route.description_template if route is not None else "{description}\n\n{hashtags}"
+
+    hashtags = list(dict.fromkeys([*candidate.hashtags, *extra_hashtags]))
     context = {
         "title": candidate.title,
         "description": candidate.description,
@@ -279,8 +331,8 @@ def handle_publish_post(session: Session, payload: dict) -> None:
         "channel": channel.title,
         "video_title": video.title,
     }
-    title = _safe_format(route.title_template, **context)
-    description = _safe_format(route.description_template, **context)
+    title = _safe_format(title_template, **context)
+    description = _safe_format(description_template, **context)
     metadata = PostMetadata(title=title, description=description, hashtags=hashtags)
 
     creds = crypto.decrypt_credentials(account.credentials_encrypted) if account.credentials_encrypted else {}

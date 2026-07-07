@@ -218,11 +218,19 @@ class Clip(Base):
 
 
 class Post(Base):
+    """A publication of a clip. Targeted either via a Route (channel->account
+    assignment) or ad-hoc via a direct account_id — exactly one of the two is set."""
+
     __tablename__ = "posts"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     clip_id: Mapped[int] = mapped_column(ForeignKey("clips.id", ondelete="CASCADE"))
-    route_id: Mapped[int] = mapped_column(ForeignKey("routes.id", ondelete="CASCADE"))
+    route_id: Mapped[int | None] = mapped_column(
+        ForeignKey("routes.id", ondelete="CASCADE"), nullable=True, default=None
+    )
+    account_id: Mapped[int | None] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE"), nullable=True, default=None
+    )
     status: Mapped[PostStatus] = mapped_column(
         Enum(PostStatus, values_callable=lambda e: [m.value for m in e]), default=PostStatus.PENDING
     )
@@ -234,9 +242,18 @@ class Post(Base):
     published_at: Mapped[datetime | None] = mapped_column(DateTime, default=None)
 
     clip: Mapped[Clip] = relationship(back_populates="posts")
-    route: Mapped[Route] = relationship()
+    route: Mapped[Route | None] = relationship()
+    account: Mapped[Account | None] = relationship()
 
-    __table_args__ = (UniqueConstraint("clip_id", "route_id", name="uq_post_clip_route"),)
+    __table_args__ = (
+        UniqueConstraint("clip_id", "route_id", name="uq_post_clip_route"),
+        UniqueConstraint("clip_id", "account_id", name="uq_post_clip_account"),
+    )
+
+    @property
+    def target_account(self) -> Account | None:
+        """The account this post publishes to, whichever way it was targeted."""
+        return self.route.account if self.route is not None else self.account
 
 
 class Job(Base):
