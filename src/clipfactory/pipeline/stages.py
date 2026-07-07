@@ -10,13 +10,16 @@ e.g. `stages.transcripts_yt.fetch_transcript` without touching the real one.
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 from pathlib import Path
 from string import Formatter
 
 from sqlalchemy.orm import Session
 
 from clipfactory import analysis, crypto, media, publish
+from clipfactory.config import get_settings
 from clipfactory.ingest import youtube as ingest_yt
+from clipfactory.media.downloader import PADDING_SEC
 from clipfactory.models import (
     CandidateStatus,
     Channel,
@@ -37,10 +40,12 @@ from clipfactory.transcripts import youtube as transcripts_yt
 
 logger = logging.getLogger(__name__)
 
-# Padding applied by media.downloader.download_section on each side of a
-# candidate's [start_sec, end_sec] window; mirrored here to translate the
-# candidate's original-video timestamps into source-file-relative ones.
-_DOWNLOAD_PADDING_SEC = 5.0
+# How many app-level retries a "no transcript yet" video gets, and for how
+# long after publish, before we give up and mark it SKIPPED for good. Fresh
+# uploads often don't have auto-captions ready immediately.
+_TRANSCRIPT_RETRY_MAX = 3
+_TRANSCRIPT_RETRY_DELAY = timedelta(hours=2)
+_TRANSCRIPT_RETRY_WINDOW = timedelta(hours=24)
 
 
 def handle_poll_channel(session: Session, payload: dict) -> None:
@@ -54,9 +59,35 @@ def handle_poll_channel(session: Session, payload: dict) -> None:
         queue.enqueue(session, JobType.FETCH_TRANSCRIPT, {"video_id": video.id})
 
 
+def _enqueue_analyze_video(session: Session, video: Video, payload: dict) -> None:
+    analyze_payload: dict = {"video_id": video.id}
+    if payload.get("analysis_overrides"):
+        analyze_payload["overrides"] = payload["analysis_overrides"]
+    queue.enqueue(session, JobType.ANALYZE_VIDEO, analyze_payload)
+
+
 def handle_fetch_transcript(session: Session, payload: dict) -> None:
+    from clipfactory.models import Transcript
+
     video = session.get(Video, payload["video_id"])
     if video is None or video.status != VideoStatus.NEW:
+        return
+
+    # Query the table directly rather than the `video.transcript` relationship:
+    # touching that relationship here (before any Transcript row exists) would
+    # cache "no transcript" on this in-session Video object, which the later
+    # success path's `session.add(Transcript(video_id=...))` -- a plain insert
+    # that bypasses the relationship -- would never invalidate.
+    existing_transcript = session.query(Transcript).filter(Transcript.video_id == video.id).one_or_none()
+    if existing_transcript is not None:
+        # A video reset to NEW for re-import (e.g. after a failed analysis)
+        # that already has a Transcript row must not attempt to insert a
+        # second one -- `transcripts.video_id` is unique. Just resume from
+        # where the pipeline actually is.
+        video.status = VideoStatus.TRANSCRIBED
+        video.error = ""
+        session.flush()
+        _enqueue_analyze_video(session, video, payload)
         return
 
     channel = video.channel
@@ -65,11 +96,24 @@ def handle_fetch_transcript(session: Session, payload: dict) -> None:
     try:
         language, segments = transcripts_yt.fetch_transcript(video.yt_video_id, preferred_languages)
     except transcripts_yt.NoTranscriptAvailable as exc:
+        retries = payload.get("transcript_retries", 0)
+        is_fresh = video.published_at is None or video.published_at > utcnow() - _TRANSCRIPT_RETRY_WINDOW
+        if retries < _TRANSCRIPT_RETRY_MAX and is_fresh:
+            # Auto-captions for a just-published video may simply not exist
+            # yet; keep the video NEW and try again later instead of
+            # dead-ending it as SKIPPED.
+            video.error = f"no transcript yet (retry {retries + 1}/{_TRANSCRIPT_RETRY_MAX}): {exc}"
+            session.flush()
+            queue.enqueue(
+                session,
+                JobType.FETCH_TRANSCRIPT,
+                {**payload, "transcript_retries": retries + 1},
+                run_at=utcnow() + _TRANSCRIPT_RETRY_DELAY,
+            )
+            return
         video.status = VideoStatus.SKIPPED
         video.error = str(exc)
         return
-
-    from clipfactory.models import Transcript
 
     session.add(
         Transcript(
@@ -82,15 +126,16 @@ def handle_fetch_transcript(session: Session, payload: dict) -> None:
     video.status = VideoStatus.TRANSCRIBED
     video.error = ""
     session.flush()
-    analyze_payload: dict = {"video_id": video.id}
-    if payload.get("analysis_overrides"):
-        analyze_payload["overrides"] = payload["analysis_overrides"]
-    queue.enqueue(session, JobType.ANALYZE_VIDEO, analyze_payload)
+    _enqueue_analyze_video(session, video, payload)
 
 
 def handle_analyze_video(session: Session, payload: dict) -> None:
-    video = session.get(Video, payload["video_id"])
-    if video is None or video.status != VideoStatus.TRANSCRIBED:
+    video_id = payload["video_id"]
+    video = session.get(Video, video_id)
+    # FAILED is accepted alongside TRANSCRIBED so a prior analyzer crash
+    # (which persists FAILED, see the except-block below) can be retried by
+    # job redelivery instead of being silently skipped forever.
+    if video is None or video.status not in (VideoStatus.TRANSCRIBED, VideoStatus.FAILED):
         return
 
     channel = video.channel
@@ -104,7 +149,20 @@ def handle_analyze_video(session: Session, payload: dict) -> None:
         language=overrides.get("language", channel.language),
     )
     analyzer = analysis.get_analyzer()
-    moments = analyzer.find_moments(segments, video.title, config)
+    try:
+        moments = analyzer.find_moments(segments, video.title, config)
+    except Exception as exc:
+        # The handler runs inside a session_scope() that rolls back on
+        # exception, which would otherwise silently discard this FAILED
+        # write along with the error message -- commit it explicitly before
+        # re-raising so it's actually visible (and so a re-import isn't
+        # blocked by a video stuck at TRANSCRIBED with an empty error).
+        session.rollback()
+        video = session.get(Video, video_id)
+        video.status = VideoStatus.FAILED
+        video.error = str(exc)[:2000]
+        session.commit()
+        raise
 
     candidates = []
     for moment in moments:
@@ -123,6 +181,7 @@ def handle_analyze_video(session: Session, payload: dict) -> None:
         candidates.append(candidate)
 
     video.status = VideoStatus.ANALYZED
+    video.error = ""
     session.flush()
     logger.info("handle_analyze_video: video %d -> %d candidate(s)", video.id, len(candidates))
 
@@ -159,13 +218,31 @@ def approve_candidate(
 def publish_clip_to_accounts(session: Session, clip: Clip, account_ids: list[int]) -> list[Post]:
     """Create ad-hoc Posts targeting accounts directly (no route needed).
 
-    Publish jobs are enqueued immediately for an already-rendered clip;
-    otherwise handle_render_clip enqueues them after rendering.
+    PUBLISH_POST jobs are enqueued immediately regardless of clip status:
+    handle_publish_post itself guards on the clip being RENDERED and raises
+    (for a backoff retry) otherwise, since a render triggered by this same
+    approval may not have committed yet by the time we get here -- waiting
+    for handle_render_clip's own tail-scan to pick the post up instead would
+    race it.
     """
     from clipfactory.models import Account
 
+    existing_posts = session.query(Post).filter(Post.clip_id == clip.id).all()
+    targeted_account_ids = {
+        post.account_id if post.account_id is not None else post.route.account_id
+        for post in existing_posts
+    }
+    targeted_account_ids.discard(None)
+
     posts = []
     for account_id in dict.fromkeys(account_ids):
+        if account_id in targeted_account_ids:
+            logger.info(
+                "publish_clip_to_accounts: skipping account %s, clip %d already targets it",
+                account_id,
+                clip.id,
+            )
+            continue
         account = session.get(Account, account_id)
         if account is None or not account.enabled:
             logger.warning("publish_clip_to_accounts: skipping unknown/disabled account %s", account_id)
@@ -178,7 +255,8 @@ def publish_clip_to_accounts(session: Session, clip: Clip, account_ids: list[int
             session.add(post)
             session.flush()
         posts.append(post)
-        if clip.status == ClipStatus.RENDERED:
+        targeted_account_ids.add(account_id)
+        if post.status == PostStatus.PENDING:
             queue.enqueue(session, JobType.PUBLISH_POST, {"post_id": post.id})
     return posts
 
@@ -198,20 +276,24 @@ def handle_render_clip(session: Session, payload: dict) -> None:
 
     video = candidate.video
     channel = video.channel
-    from clipfactory.config import get_settings
-
     settings = get_settings()
 
+    clip_id = clip.id
     clip.status = ClipStatus.RENDERING
     clip.error = ""
-    session.flush()
+    # Commit (not just flush) before the multi-minute download/ffmpeg work
+    # below: holding an open write transaction across it would keep SQLite's
+    # single writer lock the whole time, starving every other job. This also
+    # makes the RENDERING state actually crash-durable.
+    session.commit()
 
     try:
-        if video.yt_video_id.startswith("demo"):
-            # Demo videos ship a pre-placed local source file (no network):
-            # it already spans the whole video at the original time base, so
-            # no download padding applies.
-            source = settings.sources_dir / f"{video.yt_video_id}.mp4"
+        local_source = settings.sources_dir / "local" / f"{video.yt_video_id}.mp4"
+        if local_source.exists():
+            # Locally-sourced videos (demos, manual imports) ship a
+            # pre-placed file spanning the whole video at the original time
+            # base, so no download padding applies.
+            source = local_source
             source_start_sec = candidate.start_sec
             source_end_sec = candidate.end_sec
         else:
@@ -220,7 +302,7 @@ def handle_render_clip(session: Session, payload: dict) -> None:
             )
             # Mirrors downloader.download_section's padding exactly: it pads
             # by up to 5s on each side, clamped to not go below 0.
-            actual_source_start_original = max(0.0, candidate.start_sec - _DOWNLOAD_PADDING_SEC)
+            actual_source_start_original = max(0.0, candidate.start_sec - PADDING_SEC)
             source_start_sec = candidate.start_sec - actual_source_start_original
             source_end_sec = source_start_sec + (candidate.end_sec - candidate.start_sec)
 
@@ -248,14 +330,35 @@ def handle_render_clip(session: Session, payload: dict) -> None:
         clip.rendered_at = utcnow()
         clip.error = ""
     except Exception as exc:
+        # We're past the commit() above, so a plain `session.rollback()` here
+        # only discards this handler's own (uncommitted) changes -- it can't
+        # undo the RENDERING commit. Without the rollback+refetch+commit,
+        # this FAILED write would otherwise be silently discarded by the
+        # worker's session_scope() rollback when it catches the re-raise.
+        session.rollback()
+        clip = session.get(Clip, clip_id)
         clip.status = ClipStatus.FAILED
         clip.error = str(exc)[:2000]
+        session.commit()
         raise
 
     session.flush()
 
+    adhoc_targets = {
+        post.account_id
+        for post in session.query(Post).filter(Post.clip_id == clip.id, Post.account_id.isnot(None)).all()
+    }
+
     for route in channel.routes:
         if not route.enabled or not route.account.enabled:
+            continue
+        if route.account_id in adhoc_targets:
+            logger.info(
+                "handle_render_clip: skipping route %d, clip %d already has an ad-hoc post to account %s",
+                route.id,
+                clip.id,
+                route.account_id,
+            )
             continue
         post = session.query(Post).filter(Post.clip_id == clip.id, Post.route_id == route.id).one_or_none()
         if post is None:
@@ -264,8 +367,10 @@ def handle_render_clip(session: Session, payload: dict) -> None:
             session.flush()
         queue.enqueue(session, JobType.PUBLISH_POST, {"post_id": post.id})
 
-    # Ad-hoc posts created at approve time (direct account targets) wait for
-    # the render too — enqueue them now.
+    # Ad-hoc posts created at approve time (direct account targets) are
+    # normally already enqueued by publish_clip_to_accounts; this is a
+    # harmless, deduped safety net for the (race-prone) case where the
+    # render committed and started before that enqueue did.
     for post in clip.posts:
         if post.route_id is None and post.status == PostStatus.PENDING:
             queue.enqueue(session, JobType.PUBLISH_POST, {"post_id": post.id})
@@ -281,6 +386,17 @@ class _SafeFormatter(Formatter):
             return super().get_value(key, args, kwargs)
         except (KeyError, IndexError):
             return ""
+
+    def get_field(self, field_name, args, kwargs):
+        # get_field resolves attribute/index access (e.g. "{title.upper}" or
+        # "{0[foo]}"), which get_value alone doesn't cover: it can raise
+        # AttributeError, TypeError, etc. on top of KeyError/IndexError (e.g.
+        # a plain str title has no arbitrary attribute), which used to
+        # propagate out of vformat() and crash the publish job entirely.
+        try:
+            return super().get_field(field_name, args, kwargs)
+        except Exception:
+            return "", field_name
 
     def format_field(self, value, format_spec):
         try:
@@ -300,7 +416,8 @@ def _safe_format(template: str, **context: str) -> str:
 
 
 def handle_publish_post(session: Session, payload: dict) -> None:
-    post = session.get(Post, payload["post_id"])
+    post_id = payload["post_id"]
+    post = session.get(Post, post_id)
     if post is None or post.status not in (PostStatus.PENDING, PostStatus.UPLOADING):
         return
 
@@ -315,8 +432,19 @@ def handle_publish_post(session: Session, payload: dict) -> None:
     video = candidate.video
     channel = video.channel
 
+    if clip.status != ClipStatus.RENDERED:
+        # publish_clip_to_accounts enqueues ad-hoc posts unconditionally, so
+        # this job can be claimed before the render (or even the API
+        # transaction that approved the candidate) has committed. Raising
+        # lets the normal job-retry backoff handle waiting for it, instead
+        # of the post being stuck PENDING forever with nothing to re-drive it.
+        raise RuntimeError(f"clip {clip.id} not rendered yet (status={clip.status.value})")
+
     post.status = PostStatus.UPLOADING
-    session.flush()
+    # Commit before the (potentially slow, network-bound) publisher call
+    # below so it doesn't hold SQLite's write lock, and so UPLOADING is
+    # actually durable if the process dies mid-upload.
+    session.commit()
 
     extra_hashtags = route.extra_hashtags if route is not None else []
     title_template = route.title_template if route is not None else "{title}"
@@ -343,11 +471,35 @@ def handle_publish_post(session: Session, payload: dict) -> None:
     try:
         result = publisher.publish(Path(clip.file_path), metadata, credentials)
     except publish.PublishError as exc:
-        post.error = str(exc)[:2000]
+        error_msg = str(exc)[:2000]
         if exc.retryable:
+            # Past the UPLOADING commit above, so this rollback only clears
+            # this handler's own (empty, so far) uncommitted changes -- it's
+            # the refetch-then-commit that guarantees this write survives the
+            # worker's session_scope() rollback on the re-raise below.
+            session.rollback()
+            post = session.get(Post, post_id)
+            post.attempts += 1
+            post.error = error_msg
+            if post.attempts >= get_settings().job_max_attempts:
+                # Retries exhausted: the PUBLISH_POST job itself would also
+                # give up here and mark itself FAILED, but the Post used to
+                # stay PENDING forever with no error -- the API's retry
+                # endpoint only accepts FAILED posts, so this was a dead end
+                # a human could never recover from. Fail the post too, and
+                # complete the job (no raise) instead of letting it exhaust
+                # its own attempts redundantly.
+                post.status = PostStatus.FAILED
+                session.commit()
+                return
             post.status = PostStatus.PENDING
+            session.commit()
             raise
+        session.rollback()
+        post = session.get(Post, post_id)
         post.status = PostStatus.FAILED
+        post.error = error_msg
+        session.commit()
         return
 
     post.status = PostStatus.PUBLISHED

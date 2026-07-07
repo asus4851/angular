@@ -228,7 +228,7 @@ def test_instagram_happy_path(settings, monkeypatch, tmp_path):
     assert "POST /v21.0/999/media_publish" in calls
 
 
-def test_instagram_error_status_is_retryable(settings, monkeypatch, tmp_path):
+def test_instagram_error_status_is_non_retryable(settings, monkeypatch, tmp_path):
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://example.com")
     get_settings.cache_clear()
 
@@ -257,7 +257,9 @@ def test_instagram_error_status_is_retryable(settings, monkeypatch, tmp_path):
     with pytest.raises(PublishError) as exc_info:
         publisher.publish(clip, _metadata(), {"access_token": "tok", "ig_user_id": "999"})
 
-    assert exc_info.value.retryable is True
+    # ERROR is Instagram's deterministic rejection of this container (bad/corrupt
+    # video, disallowed content, etc.) -- retrying the exact same input won't help.
+    assert exc_info.value.retryable is False
 
 
 # ---------------------------------------------------------------------------
@@ -330,3 +332,227 @@ def test_tiktok_server_error_is_retryable(settings, monkeypatch, tmp_path):
         publisher.publish(clip, _metadata(), {"access_token": "tok"})
 
     assert exc_info.value.retryable is True
+
+
+def test_tiktok_chunking_math_single_vs_multi_chunk():
+    from clipfactory.publish.tiktok import TikTokPublisher
+
+    # At/under the 64MB threshold: one chunk covering the whole file.
+    size = 64 * 1024 * 1024
+    assert TikTokPublisher._chunking(size) == (size, 1)
+
+    # Just over: multi-chunk, final chunk absorbs the floor-division remainder
+    # and must stay comfortably over the 5MB TikTok minimum for a final chunk.
+    size = 64 * 1024 * 1024 + 1
+    chunk_size, total_chunks = TikTokPublisher._chunking(size)
+    assert chunk_size == 10 * 1024 * 1024
+    last_chunk = size - (total_chunks - 1) * chunk_size
+    assert last_chunk >= 5 * 1024 * 1024
+    assert (total_chunks - 1) * chunk_size + last_chunk == size
+
+    # A size that divides evenly still yields a full-size final chunk.
+    size = 70 * 1024 * 1024
+    chunk_size, total_chunks = TikTokPublisher._chunking(size)
+    assert total_chunks == 7
+    assert chunk_size * total_chunks == size
+
+
+def test_tiktok_multi_chunk_upload_streams_without_loading_whole_file(settings, monkeypatch, tmp_path):
+    import clipfactory.publish.tiktok as tiktok_module
+
+    # Small stand-in thresholds so the test can use a tiny file instead of >64MB.
+    monkeypatch.setattr(tiktok_module, "_SINGLE_CHUNK_MAX", 100)
+    monkeypatch.setattr(tiktok_module, "_CHUNK_SIZE", 100)
+
+    def _boom_read_bytes(self):
+        raise AssertionError("must not read_bytes() the whole clip into memory")
+
+    monkeypatch.setattr(Path, "read_bytes", _boom_read_bytes)
+
+    ranges: list[str] = []
+    bodies: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/init/"):
+            payload = json.loads(request.content)
+            assert payload["source_info"]["total_chunk_count"] == 2
+            assert payload["source_info"]["chunk_size"] == 100
+            return httpx.Response(
+                200,
+                json={"data": {"publish_id": "pub-multi", "upload_url": "https://upload.tiktokapis.com/upload"}},
+            )
+        if request.url.host == "upload.tiktokapis.com":
+            ranges.append(request.headers["content-range"])
+            bodies.append(request.content)
+            return httpx.Response(201)
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.Client
+
+    def fake_client(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(tiktok_module.httpx, "Client", fake_client)
+
+    content = bytes(range(256)) * 1  # 256 distinct-ish bytes so ranges are verifiable
+    content = (b"a" * 100) + (b"b" * 150)  # 250 bytes total: chunk0=100, chunk1(last)=150
+    clip = _make_clip(tmp_path, content=content)
+    publisher = get_publisher("tiktok")
+    result = publisher.publish(clip, _metadata(), {"access_token": "tok"})
+
+    assert result.external_id == "pub-multi"
+    assert ranges == ["bytes 0-99/250", "bytes 100-249/250"]
+    assert bodies == [b"a" * 100, b"b" * 150]
+
+
+# ---------------------------------------------------------------------------
+# Credential redaction
+# ---------------------------------------------------------------------------
+
+
+def test_redact_scrubs_secret_values_and_access_token_query_param():
+    from clipfactory.publish.base import redact
+
+    text = (
+        "boom calling https://api.example.com/x?access_token=SECRET123&foo=bar "
+        "(raw token SECRET123 leaked twice)"
+    )
+    redacted = redact(text, ["SECRET123"])
+    assert "SECRET123" not in redacted
+    assert "access_token=***" in redacted
+
+
+def test_redact_handles_access_token_it_does_not_know_verbatim():
+    from clipfactory.publish.base import redact
+
+    # Even with an empty/unknown secrets list, the access_token=... pattern itself
+    # gets scrubbed by the regex fallback.
+    text = "GET https://graph.facebook.com/v21.0/x?access_token=IG_TOKEN_ABC&fields=y"
+    redacted = redact(text, [])
+    assert "IG_TOKEN_ABC" not in redacted
+    assert "access_token=***" in redacted
+
+
+class _RaisingClient:
+    """Minimal httpx.Client stand-in whose every call raises an HTTPError whose
+    message embeds the given secret, simulating a leaky exception string."""
+
+    def __init__(self, secret: str, url_fragment: str) -> None:
+        self._secret = secret
+        self._url_fragment = url_fragment
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def post(self, url, **kwargs):
+        raise httpx.ConnectError(f"failed to reach {url}{self._url_fragment}{self._secret}")
+
+    def get(self, url, **kwargs):
+        raise httpx.ConnectError(f"failed to reach {url}{self._url_fragment}{self._secret}")
+
+    def put(self, url, **kwargs):
+        raise httpx.ConnectError(f"failed to reach {url}{self._url_fragment}{self._secret}")
+
+
+def test_instagram_network_error_message_is_redacted(settings, monkeypatch, tmp_path):
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://example.com")
+    get_settings.cache_clear()
+
+    import clipfactory.publish.instagram as instagram_module
+
+    secret_token = "SUPER-SECRET-IG-TOKEN"
+    monkeypatch.setattr(
+        instagram_module.httpx,
+        "Client",
+        lambda *a, **kw: _RaisingClient(secret_token, "?access_token="),
+    )
+
+    clip = _make_clip(tmp_path)
+    publisher = get_publisher("instagram")
+
+    with pytest.raises(PublishError) as exc_info:
+        publisher.publish(clip, _metadata(), {"access_token": secret_token, "ig_user_id": "999"})
+
+    message = str(exc_info.value)
+    assert secret_token not in message
+    assert "***" in message
+
+
+def test_tiktok_network_error_message_is_redacted(settings, monkeypatch, tmp_path):
+    import clipfactory.publish.tiktok as tiktok_module
+
+    secret_token = "SUPER-SECRET-TT-TOKEN"
+    monkeypatch.setattr(
+        tiktok_module.httpx,
+        "Client",
+        lambda *a, **kw: _RaisingClient(secret_token, "?token="),
+    )
+
+    clip = _make_clip(tmp_path, content=b"x" * 10)
+    publisher = get_publisher("tiktok")
+
+    with pytest.raises(PublishError) as exc_info:
+        publisher.publish(clip, _metadata(), {"access_token": secret_token})
+
+    message = str(exc_info.value)
+    assert secret_token not in message
+    assert "***" in message
+
+
+# ---------------------------------------------------------------------------
+# YouTube retryable classification
+# ---------------------------------------------------------------------------
+
+
+def _fake_http_error(status_code: int):
+    from googleapiclient.errors import HttpError
+
+    resp = type("Resp", (), {"status": status_code, "reason": "error"})()
+    return HttpError(resp, b"error content")
+
+
+@pytest.mark.parametrize(
+    "status_code,expected_retryable",
+    [
+        (400, False),
+        (401, False),
+        (403, False),
+        (404, False),
+        (408, True),
+        (429, True),
+        (500, True),
+        (503, True),
+    ],
+)
+def test_youtube_http_error_retryable_classification(settings, monkeypatch, tmp_path, status_code, expected_retryable):
+    class _FakeRequest:
+        def next_chunk(self):
+            raise _fake_http_error(status_code)
+
+    class _FakeVideos:
+        def insert(self, **kwargs):
+            return _FakeRequest()
+
+    class _FakeYouTube:
+        def videos(self):
+            return _FakeVideos()
+
+    monkeypatch.setattr("googleapiclient.discovery.build", lambda *a, **kw: _FakeYouTube())
+
+    clip = _make_clip(tmp_path)
+    publisher = get_publisher("youtube")
+
+    with pytest.raises(PublishError) as exc_info:
+        publisher.publish(
+            clip,
+            _metadata(),
+            {"client_id": "id", "client_secret": "sec", "refresh_token": "SUPER-SECRET-REFRESH"},
+        )
+
+    assert exc_info.value.retryable is expected_retryable
+    assert "SUPER-SECRET-REFRESH" not in str(exc_info.value)

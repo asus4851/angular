@@ -44,6 +44,8 @@ def start_scheduler(stop_event: threading.Event) -> threading.Thread:
         logger.info("scheduler: starting (interval=%ds)", _LOOP_INTERVAL_SEC)
         while not stop_event.is_set():
             try:
+                with session_scope() as session:
+                    queue.requeue_stale_running(session)
                 enqueue_due_polls()
             except Exception:
                 logger.exception("scheduler: error enqueueing due polls")

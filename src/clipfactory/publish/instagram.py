@@ -26,6 +26,7 @@ from clipfactory.publish.base import (
     compose_description,
     dry_run_guard,
     raise_for_http_status,
+    redact,
     register,
 )
 from clipfactory.schemas import PostMetadata
@@ -74,7 +75,9 @@ class InstagramReelsPublisher:
                 media_id = self._publish_container(client, ig_user_id, creation_id, access_token)
                 permalink = self._fetch_permalink(client, media_id, access_token)
         except httpx.HTTPError as exc:
-            raise PublishError(f"Instagram publish failed: {exc}", retryable=True) from exc
+            raise PublishError(
+                redact(f"Instagram publish failed: {exc}", [access_token]), retryable=True
+            ) from exc
 
         logger.info("InstagramReelsPublisher: published reel %s", media_id)
         return PublishResult(external_id=media_id, external_url=permalink)
@@ -91,7 +94,7 @@ class InstagramReelsPublisher:
                 "access_token": access_token,
             },
         )
-        raise_for_http_status(resp, "Instagram")
+        raise_for_http_status(resp, "Instagram", secrets=[access_token])
         return resp.json()["id"]
 
     def _wait_until_finished(self, client: httpx.Client, creation_id: str, access_token: str) -> None:
@@ -102,12 +105,14 @@ class InstagramReelsPublisher:
                 f"{_GRAPH_BASE}/{creation_id}",
                 params={"fields": "status_code", "access_token": access_token},
             )
-            raise_for_http_status(resp, "Instagram")
+            raise_for_http_status(resp, "Instagram", secrets=[access_token])
             status_code = resp.json().get("status_code")
             if status_code == "FINISHED":
                 return
             if status_code == "ERROR":
-                raise PublishError(f"Instagram failed to process media {creation_id}", retryable=True)
+                # A deterministic rejection by Instagram (bad/corrupt video, disallowed
+                # content, etc.) — retrying the exact same container will fail again.
+                raise PublishError(f"Instagram failed to process media {creation_id}", retryable=False)
             time.sleep(_POLL_INTERVAL_SEC)
         raise PublishError(
             f"Instagram media {creation_id} did not finish processing within "
@@ -120,7 +125,7 @@ class InstagramReelsPublisher:
             f"{_GRAPH_BASE}/{ig_user_id}/media_publish",
             data={"creation_id": creation_id, "access_token": access_token},
         )
-        raise_for_http_status(resp, "Instagram")
+        raise_for_http_status(resp, "Instagram", secrets=[access_token])
         return resp.json()["id"]
 
     def _fetch_permalink(self, client: httpx.Client, media_id: str, access_token: str) -> str:

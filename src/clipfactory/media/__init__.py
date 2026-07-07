@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from clipfactory.media.captions import build_ass, format_ass_time
-from clipfactory.media.downloader import DownloadError, download_full, download_section
+from clipfactory.media.downloader import PADDING_SEC, DownloadError, download_section
 from clipfactory.media.renderer import (
     RenderError,
     build_ffmpeg_command,
@@ -15,7 +15,7 @@ from clipfactory.media.renderer import (
 __all__ = [
     "DownloadError",
     "download_section",
-    "download_full",
+    "PADDING_SEC",
     "build_ass",
     "format_ass_time",
     "RenderError",

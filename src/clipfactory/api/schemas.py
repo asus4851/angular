@@ -27,6 +27,7 @@ class ChannelOut(BaseModel):
     max_clips_per_video: int
     min_score: int
     language: str
+    render_preset: dict = {}
     created_at: datetime
     last_checked_at: datetime | None = None
 
@@ -38,6 +39,7 @@ class ChannelCreate(BaseModel):
     max_clips_per_video: int = 3
     min_score: int = 60
     language: str = ""
+    render_preset: dict | None = None
 
 
 class ChannelUpdate(BaseModel):
@@ -47,6 +49,7 @@ class ChannelUpdate(BaseModel):
     min_score: int | None = None
     max_clips_per_video: int | None = None
     language: str | None = None
+    render_preset: dict | None = None
 
 
 class AccountOut(BaseModel):
@@ -149,6 +152,23 @@ class ChannelImportRequest(BaseModel):
     title: str | None = None
     max_clips: int | None = None
     min_score: int | None = None
+    language: str | None = None
+
+
+def analysis_overrides(max_clips: int | None, min_score: int | None, language: str | None = None) -> dict:
+    """Build the `{"max_clips": ..., "min_score": ..., "language": ...}` overrides
+    dict passed as job payload to FETCH_TRANSCRIPT/ANALYZE_VIDEO jobs, keeping only
+    the fields the caller actually specified. Shared by the video-import and
+    channel-import routers so they don't each hand-roll (and potentially drift
+    on) this mapping."""
+    overrides: dict = {}
+    if max_clips is not None:
+        overrides["max_clips"] = max_clips
+    if min_score is not None:
+        overrides["min_score"] = min_score
+    if language is not None:
+        overrides["language"] = language
+    return overrides
 
 
 class ChannelImportOut(BaseModel):
@@ -193,9 +213,12 @@ class CandidateOut(BaseModel):
 class PostOut(BaseModel):
     id: int
     clip_id: int
-    route_id: int
-    account_platform: Platform
-    account_name: str
+    route_id: int | None
+    account_id: int | None
+    # None when the post's target account was deleted out from under it (an
+    # edge case; normally cascading deletes remove the post along with it).
+    account_platform: Platform | None = None
+    account_name: str = "—"
     status: PostStatus
     external_id: str
     external_url: str
@@ -205,16 +228,16 @@ class PostOut(BaseModel):
     published_at: datetime | None = None
 
 
+class FailedJobOut(BaseModel):
+    type: JobType
+    error: str
+    run_at: datetime
+
+
 class StatsOut(BaseModel):
     videos: dict[str, int]
     candidates: dict[str, int]
     clips: dict[str, int]
     posts: dict[str, int]
     jobs: dict[str, int]
-    recent_failed_jobs: list[dict]
-
-
-class FailedJobOut(BaseModel):
-    type: JobType
-    error: str
-    run_at: datetime
+    recent_failed_jobs: list[FailedJobOut]

@@ -7,10 +7,13 @@
 <table>
   <tr><th>Кліп</th><th>Маршрут</th><th>Акаунт</th><th>Статус</th><th>URL / помилка</th><th></th></tr>
   {% for p in posts %}
+  {% set acct = p.target_account %}
   <tr id="post-{{ p.id }}">
     <td>#{{ p.clip_id }}</td>
-    <td>#{{ p.route_id }}</td>
-    <td><span class="badge platform">{{ p.route.account.platform.value }}</span> {{ p.route.account.name }}</td>
+    <td>{% if p.route_id %}#{{ p.route_id }}{% else %}—{% endif %}</td>
+    <td>
+      {% if acct %}<span class="badge platform">{{ acct.platform.value }}</span> {{ acct.name }}{% else %}—{% endif %}
+    </td>
     <td><span class="badge {{ p.status.value }}">{{ p.status.value }}</span></td>
     <td>
       {% if p.external_url %}<a class="link" href="{{ p.external_url }}" target="_blank">посилання</a>{% endif %}

@@ -16,6 +16,7 @@ from clipfactory.models import (
     JobType,
     Platform,
     Post,
+    PostStatus,
     Video,
     VideoStatus,
 )
@@ -108,7 +109,7 @@ def test_import_video_reuses_existing_channel(client, db, monkeypatch):
         "clipfactory.ingest.youtube.fetch_video_info", lambda url: (video_info, channel_info)
     )
 
-    res = client.post("/api/videos", json={"url": "https://youtube.com/watch?v=x"})
+    res = client.post("/api/videos", json={"url": f"https://youtube.com/watch?v={SAMPLE_VIDEO_ID}"})
     assert res.status_code == 201, res.text
 
     with db() as session:
@@ -454,3 +455,207 @@ def test_channel_videos_page_renders(client, db):
 def test_channel_videos_page_404_for_missing_channel(client):
     res = client.get("/channels/9999/videos")
     assert res.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Video import SSRF guard
+# ---------------------------------------------------------------------------
+
+
+def test_import_video_rejects_non_youtube_url(client, monkeypatch):
+    # Should be rejected before fetch_video_info (and therefore yt-dlp) ever
+    # sees the URL -- fetch_video_info is deliberately left unmocked here.
+    res = client.post("/api/videos", json={"url": "https://evil.example.com/whatever"})
+    assert res.status_code == 422
+    assert "YouTube" in res.json()["detail"] or "youtube" in res.json()["detail"].lower()
+
+
+def test_import_video_rejects_bare_garbage_string(client):
+    res = client.post("/api/videos", json={"url": "not a url at all"})
+    assert res.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Ad-hoc posts (nullable route_id / account_id on Post)
+# ---------------------------------------------------------------------------
+
+
+def test_list_posts_and_posts_page_survive_adhoc_post(client, db):
+    """A post targeted directly at an account (route_id=None) must not crash
+    GET /api/posts or the /posts dashboard page (previously both assumed
+    `post.route.account`)."""
+    with db() as session:
+        channel = Channel(yt_channel_id=SAMPLE_CHANNEL_ID, title="C")
+        account = Account(platform=Platform.LOCAL, name="adhoc-only")
+        session.add_all([channel, account])
+        session.flush()
+        video = Video(channel_id=channel.id, yt_video_id=SAMPLE_VIDEO_ID, status=VideoStatus.ANALYZED)
+        session.add(video)
+        session.flush()
+        candidate = ClipCandidate(video_id=video.id, start_sec=1.0, end_sec=10.0, score=90, title="Moment")
+        session.add(candidate)
+        session.flush()
+        clip = Clip(candidate_id=candidate.id, status=ClipStatus.RENDERED, file_path="/tmp/x.mp4")
+        session.add(clip)
+        session.flush()
+        post = Post(clip_id=clip.id, route_id=None, account_id=account.id, status=PostStatus.PENDING)
+        session.add(post)
+        session.flush()
+        account_id = account.id
+
+    res = client.get("/api/posts")
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert len(body) == 1
+    assert body[0]["route_id"] is None
+    assert body[0]["account_id"] == account_id
+    assert body[0]["account_name"] == "adhoc-only"
+    assert body[0]["account_platform"] == "local"
+
+    res = client.get("/posts")
+    assert res.status_code == 200
+    assert "text/html" in res.headers["content-type"]
+    assert "adhoc-only" in res.text
+
+
+# ---------------------------------------------------------------------------
+# Clip re-render
+# ---------------------------------------------------------------------------
+
+
+def _make_failed_clip(db):
+    with db() as session:
+        channel = Channel(yt_channel_id=SAMPLE_CHANNEL_ID, title="C")
+        session.add(channel)
+        session.flush()
+        video = Video(channel_id=channel.id, yt_video_id=SAMPLE_VIDEO_ID, status=VideoStatus.ANALYZED)
+        session.add(video)
+        session.flush()
+        candidate = ClipCandidate(video_id=video.id, start_sec=1.0, end_sec=10.0, score=90, title="Broken")
+        session.add(candidate)
+        session.flush()
+        clip = Clip(candidate_id=candidate.id, status=ClipStatus.FAILED, error="ffmpeg exploded")
+        session.add(clip)
+        session.flush()
+        return clip.id, candidate.id
+
+
+def test_render_failed_clip_requeues_it(client, db):
+    clip_id, candidate_id = _make_failed_clip(db)
+
+    res = client.post(f"/api/clips/{clip_id}/render")
+    assert res.status_code == 200, res.text
+    assert res.json()["status"] == "queued"
+
+    with db() as session:
+        clip = session.get(Clip, clip_id)
+        assert clip.status == ClipStatus.QUEUED
+        assert clip.error == ""
+        jobs = session.query(Job).filter(Job.type == JobType.RENDER_CLIP).all()
+        assert len(jobs) == 1
+        assert jobs[0].payload == {"candidate_id": candidate_id}
+
+
+def test_render_non_failed_clip_returns_409(client, db):
+    with db() as session:
+        channel = Channel(yt_channel_id=SAMPLE_CHANNEL_ID, title="C")
+        session.add(channel)
+        session.flush()
+        video = Video(channel_id=channel.id, yt_video_id=SAMPLE_VIDEO_ID, status=VideoStatus.ANALYZED)
+        session.add(video)
+        session.flush()
+        candidate = ClipCandidate(video_id=video.id, start_sec=1.0, end_sec=10.0, score=90)
+        session.add(candidate)
+        session.flush()
+        clip = Clip(candidate_id=candidate.id, status=ClipStatus.RENDERED)
+        session.add(clip)
+        session.flush()
+        clip_id = clip.id
+
+    res = client.post(f"/api/clips/{clip_id}/render")
+    assert res.status_code == 409
+
+
+def test_render_missing_clip_404(client):
+    res = client.post("/api/clips/9999/render")
+    assert res.status_code == 404
+
+
+def test_moderation_page_lists_failed_clip_with_retry_button(client, db):
+    clip_id, _ = _make_failed_clip(db)
+
+    res = client.get("/moderation")
+    assert res.status_code == 200
+    assert f"retryRender({clip_id})" in res.text
+    assert "ffmpeg exploded" in res.text
+
+
+# ---------------------------------------------------------------------------
+# Channel render_preset validation
+# ---------------------------------------------------------------------------
+
+
+def test_create_channel_with_valid_render_preset(client, monkeypatch):
+    monkeypatch.setattr(
+        "clipfactory.ingest.youtube.resolve_channel",
+        lambda url: ChannelInfo(yt_channel_id=SAMPLE_CHANNEL_ID, title="Test Channel", url=url),
+    )
+
+    res = client.post(
+        "/api/channels",
+        json={"url": "https://youtube.com/@test", "render_preset": {"width": 720, "height": 1280}},
+    )
+    assert res.status_code == 201, res.text
+    assert res.json()["render_preset"] == {"width": 720, "height": 1280}
+
+
+def test_create_channel_with_invalid_render_preset_returns_422(client, monkeypatch):
+    monkeypatch.setattr(
+        "clipfactory.ingest.youtube.resolve_channel",
+        lambda url: ChannelInfo(yt_channel_id=SAMPLE_CHANNEL_ID, title="Test Channel", url=url),
+    )
+
+    res = client.post(
+        "/api/channels",
+        json={"url": "https://youtube.com/@test", "render_preset": {"not_a_real_field": 1}},
+    )
+    assert res.status_code == 422
+
+
+def test_patch_channel_with_invalid_render_preset_returns_422(client, db):
+    with db() as session:
+        channel = Channel(yt_channel_id=SAMPLE_CHANNEL_ID, title="C")
+        session.add(channel)
+        session.flush()
+        channel_id = channel.id
+
+    res = client.patch(f"/api/channels/{channel_id}", json={"render_preset": {"mode": "not-a-valid-mode"}})
+    assert res.status_code == 422
+
+    res = client.patch(f"/api/channels/{channel_id}", json={"render_preset": {"mode": "blur-pad"}})
+    assert res.status_code == 200, res.text
+    assert res.json()["render_preset"] == {"mode": "blur-pad"}
+
+
+# ---------------------------------------------------------------------------
+# Channel import: language parity with video import
+# ---------------------------------------------------------------------------
+
+
+def test_channel_import_with_language_override(client, db):
+    with db() as session:
+        channel = Channel(yt_channel_id=SAMPLE_CHANNEL_ID, title="C")
+        session.add(channel)
+        session.flush()
+        channel_id = channel.id
+
+    res = client.post(
+        f"/api/channels/{channel_id}/import",
+        json={"yt_video_id": SAMPLE_VIDEO_ID, "max_clips": 2, "language": "uk"},
+    )
+    assert res.status_code == 201, res.text
+
+    with db() as session:
+        jobs = session.query(Job).filter(Job.type == JobType.FETCH_TRANSCRIPT).all()
+        assert len(jobs) == 1
+        assert jobs[0].payload["analysis_overrides"] == {"max_clips": 2, "language": "uk"}

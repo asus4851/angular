@@ -21,7 +21,9 @@ from clipfactory.publish.base import (
     PublishError,
     PublishResult,
     dry_run_guard,
+    format_hashtags,
     raise_for_http_status,
+    redact,
     register,
 )
 from clipfactory.schemas import PostMetadata
@@ -46,8 +48,7 @@ class TikTokPublisher:
         if not access_token:
             raise PublishError("TikTok credentials missing required key: access_token", retryable=False)
 
-        video_bytes = clip_path.read_bytes()
-        size = len(video_bytes)
+        size = clip_path.stat().st_size
         chunk_size, total_chunks = self._chunking(size)
         title = self._compose_title(metadata)
         headers = {"Authorization": f"Bearer {access_token}"}
@@ -69,17 +70,20 @@ class TikTokPublisher:
         }
 
         try:
-            with httpx.Client(timeout=60) as client:
+            with httpx.Client(timeout=60) as client, clip_path.open("rb") as fh:
                 init_resp = client.post(_INIT_URL, json=payload, headers=headers)
-                raise_for_http_status(init_resp, "TikTok")
+                raise_for_http_status(init_resp, "TikTok", secrets=[access_token])
                 init_data = init_resp.json()["data"]
                 publish_id = init_data["publish_id"]
                 upload_url = init_data["upload_url"]
 
                 for chunk_index in range(total_chunks):
                     start = chunk_index * chunk_size
-                    end = min(start + chunk_size, size) - 1
-                    chunk = video_bytes[start : end + 1]
+                    # The final chunk absorbs whatever remainder floor division left
+                    # behind, per TikTok's FILE_UPLOAD chunking rules (see `_chunking`).
+                    end = size - 1 if chunk_index == total_chunks - 1 else start + chunk_size - 1
+                    fh.seek(start)
+                    chunk = fh.read(end - start + 1)
                     put_resp = client.put(
                         upload_url,
                         content=chunk,
@@ -88,22 +92,26 @@ class TikTokPublisher:
                             "Content-Type": "video/mp4",
                         },
                     )
-                    raise_for_http_status(put_resp, "TikTok")
+                    raise_for_http_status(put_resp, "TikTok", secrets=[access_token])
         except httpx.HTTPError as exc:
-            raise PublishError(f"TikTok publish failed: {exc}", retryable=True) from exc
+            raise PublishError(redact(f"TikTok publish failed: {exc}", [access_token]), retryable=True) from exc
 
         logger.info("TikTokPublisher: uploaded video, publish_id=%s", publish_id)
         return PublishResult(external_id=publish_id, external_url="")
 
     @staticmethod
     def _chunking(size: int) -> tuple[int, int]:
+        """TikTok FILE_UPLOAD chunking: non-final chunks are exactly `chunk_size`,
+        the final chunk absorbs the remainder (so it's always >= `chunk_size`,
+        comfortably over TikTok's 5MB-minimum-final-chunk rule for multi-chunk
+        uploads)."""
         if size <= _SINGLE_CHUNK_MAX:
             return size, 1
-        total_chunks = (size + _CHUNK_SIZE - 1) // _CHUNK_SIZE
+        total_chunks = max(size // _CHUNK_SIZE, 1)
         return _CHUNK_SIZE, total_chunks
 
     @staticmethod
     def _compose_title(metadata: PostMetadata) -> str:
-        tags = " ".join(f"#{tag.lstrip('#')}" for tag in metadata.hashtags if tag.strip())
+        tags = format_hashtags(metadata.hashtags)
         title = f"{metadata.title} {tags}".strip() if tags else metadata.title
         return title[:2200]

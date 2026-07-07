@@ -27,7 +27,6 @@ from clipfactory.models import (
     Clip,
     ClipCandidate,
     Job,
-    JobStatus,
     Platform,
     Post,
     Route,
@@ -188,7 +187,9 @@ def reject(candidate_id: int) -> None:
 def channel_add(
     url: str,
     auto_approve: bool = typer.Option(False, "--auto-approve"),
-    interval: int = typer.Option(30, "--interval", help="Poll interval in minutes"),
+    interval: int | None = typer.Option(
+        None, "--interval", help="Poll interval in minutes (default: POLL_INTERVAL_MIN)"
+    ),
     max_clips: int = typer.Option(3, "--max-clips"),
     min_score: int = typer.Option(60, "--min-score"),
     language: str = typer.Option("", "--language"),
@@ -206,7 +207,7 @@ def channel_add(
             title=info.title,
             url=info.url,
             auto_approve=auto_approve,
-            check_interval_min=interval,
+            check_interval_min=interval if interval is not None else get_settings().poll_interval_min,
             max_clips_per_video=max_clips,
             min_score=min_score,
             language=language,
@@ -410,7 +411,11 @@ def _get_or_create_demo_channel(session) -> Channel:
         yt_channel_id=_DEMO_CHANNEL_ID,
         title="ClipFactory Demo Channel",
         url=f"https://www.youtube.com/channel/{_DEMO_CHANNEL_ID}",
-        enabled=True,
+        # The demo enqueues its ANALYZE_VIDEO job directly and never polls
+        # YouTube, so leaving this enabled would just have the scheduler
+        # hammer the network forever trying (and failing) to poll a channel
+        # id that doesn't really exist.
+        enabled=False,
         auto_approve=True,
         check_interval_min=30,
         max_clips_per_video=3,
@@ -470,7 +475,9 @@ def run_demo() -> dict:
         account = _get_or_create_demo_account(session)
         _get_or_create_demo_route(session, channel, account)
 
-        source_path = settings.sources_dir / f"{_DEMO_VIDEO_ID}.mp4"
+        # Placed under sources_dir/local/ so handle_render_clip picks it up
+        # via the general local-source mechanism (no network download).
+        source_path = settings.sources_dir / "local" / f"{_DEMO_VIDEO_ID}.mp4"
         if not source_path.exists():
             media.make_test_video(source_path, duration=_DEMO_DURATION_SEC)
 

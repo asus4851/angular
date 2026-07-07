@@ -10,6 +10,8 @@ pulls in `googleapiclient` or `httpx` unless that platform is actually used.
 from __future__ import annotations
 
 import logging
+import re
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Protocol
 
@@ -18,6 +20,25 @@ from clipfactory.models import Platform
 from clipfactory.schemas import PostMetadata, PublishResult
 
 logger = logging.getLogger(__name__)
+
+_ACCESS_TOKEN_RE = re.compile(r"access_token=[^&\s\"']+")
+
+
+def redact(text: str, secrets: Iterable[str]) -> str:
+    """Scrub credential values out of a string before it's stored/logged.
+
+    Replaces every occurrence of each (non-empty) secret in `secrets` with
+    `"***"`, then also regex-redacts any `access_token=...` fragment that
+    might have leaked into a URL or request body via a path we don't control
+    (e.g. an httpx exception's stringified request). Used to sanitize
+    `PublishError` messages before they land in `post.error` and get shown on
+    the dashboard.
+    """
+    redacted = text
+    for secret in secrets:
+        if secret:
+            redacted = redacted.replace(secret, "***")
+    return _ACCESS_TOKEN_RE.sub("access_token=***", redacted)
 
 
 class PublishError(RuntimeError):
@@ -99,26 +120,34 @@ def dry_run_guard(platform: str, metadata: PostMetadata) -> PublishResult | None
     return None
 
 
+def format_hashtags(tags: list[str]) -> str:
+    """Join tag strings into a single `"#tag1 #tag2"` string, normalizing away
+    any leading `#` already present and skipping blanks."""
+    return " ".join(f"#{tag.lstrip('#')}" for tag in tags if tag.strip())
+
+
 def compose_description(metadata: PostMetadata) -> str:
     """Join description + hashtags (as "#tag") into the final post body."""
     parts = []
     if metadata.description:
         parts.append(metadata.description)
-    tags = " ".join(f"#{tag.lstrip('#')}" for tag in metadata.hashtags if tag.strip())
+    tags = format_hashtags(metadata.hashtags)
     if tags:
         parts.append(tags)
     return "\n\n".join(parts)
 
 
-def raise_for_http_status(response, service: str) -> None:
+def raise_for_http_status(response, service: str, secrets: Iterable[str] = ()) -> None:
     """Shared 4xx/5xx -> PublishError mapping for httpx-based publishers.
 
     429 and 5xx are treated as transient (retryable); other 4xx are treated
-    as permanent client errors (bad token, bad payload, etc.).
+    as permanent client errors (bad token, bad payload, etc.). `secrets`
+    (e.g. the access token used for this call) are redacted out of the
+    response body before it's embedded in the error message, since that
+    message is persisted to `post.error` and shown on the dashboard.
     """
     if response.status_code < 400:
         return
     retryable = response.status_code == 429 or response.status_code >= 500
-    raise PublishError(
-        f"{service} API error {response.status_code}: {response.text[:300]}", retryable=retryable
-    )
+    message = f"{service} API error {response.status_code}: {response.text[:300]}"
+    raise PublishError(redact(message, secrets), retryable=retryable)

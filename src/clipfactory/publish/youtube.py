@@ -11,7 +11,14 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from clipfactory.publish.base import PublishError, PublishResult, compose_description, dry_run_guard, register
+from clipfactory.publish.base import (
+    PublishError,
+    PublishResult,
+    compose_description,
+    dry_run_guard,
+    redact,
+    register,
+)
 from clipfactory.schemas import PostMetadata
 
 logger = logging.getLogger(__name__)
@@ -71,8 +78,12 @@ class YouTubeShortsPublisher:
             video_id = response["id"]
         except HttpError as exc:
             status_code = exc.resp.status if exc.resp is not None else None
-            retryable = status_code not in (401, 403)
-            raise PublishError(f"YouTube upload failed: {exc}", retryable=retryable) from exc
+            # Non-retryable for any 4xx except 408 (timeout) and 429 (rate limit),
+            # which — like 5xx and network errors — are transient and worth a retry.
+            non_retryable = status_code is not None and 400 <= status_code < 500 and status_code not in (408, 429)
+            retryable = not non_retryable
+            secrets = [credentials.get("refresh_token", ""), credentials.get("client_secret", "")]
+            raise PublishError(redact(f"YouTube upload failed: {exc}", secrets), retryable=retryable) from exc
 
         logger.info("YouTubeShortsPublisher: uploaded video %s", video_id)
         return PublishResult(external_id=video_id, external_url=f"https://youtube.com/shorts/{video_id}")

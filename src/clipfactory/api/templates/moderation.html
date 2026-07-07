@@ -71,6 +71,24 @@
 <div class="empty">Немає готових кліпів без публікацій</div>
 {% endif %}
 
+<h2>Кліпи з помилкою рендеру</h2>
+{% if failed_clips %}
+<div class="grid-cards">
+  {% for clip in failed_clips %}
+  <div class="candidate-card" id="failed-clip-{{ clip.id }}">
+    <h3>{{ clip.candidate.title if clip.candidate else "Без назви" }}</h3>
+    <div class="meta">Кліп #{{ clip.id }}</div>
+    {% if clip.error %}<div class="muted">{{ clip.error }}</div>{% endif %}
+    <div class="actions">
+      <button class="small secondary" onclick="retryRender({{ clip.id }})">Повторити рендер</button>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="empty">Немає кліпів з помилкою рендеру</div>
+{% endif %}
+
 <script>
 async function approveCandidate(id) {
   const checks = document.querySelectorAll(`.account-pick[data-candidate="${id}"]:checked`);
@@ -93,6 +111,16 @@ async function rejectCandidate(id) {
     document.getElementById(`candidate-${id}`).remove();
   } else {
     alert('Помилка відхилення');
+  }
+}
+
+async function retryRender(id) {
+  const res = await fetch(`/api/clips/${id}/render`, { method: 'POST' });
+  if (res.ok) {
+    document.getElementById(`failed-clip-${id}`).remove();
+  } else {
+    const err = await res.json().catch(() => ({}));
+    alert(err.detail || 'Помилка повторного рендеру');
   }
 }
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -14,10 +15,26 @@ from clipfactory.api.schemas import (
     ChannelImportRequest,
     ChannelOut,
     ChannelUpdate,
+    analysis_overrides,
 )
 from clipfactory.models import Channel, Video, VideoStatus
+from clipfactory.schemas import RenderPreset
 
 router = APIRouter(prefix="/api/channels", tags=["channels"])
+
+
+def _validated_render_preset(value: dict | None) -> dict:
+    """Validate `value` against `RenderPreset` (rejecting unknown/invalid keys)
+    and return it as a plain dict for storage on `Channel.render_preset`. Doing
+    this at the API boundary means `RenderPreset(**channel.render_preset)` in
+    the render pipeline can never blow up on stray keys."""
+    if value is None:
+        return {}
+    try:
+        RenderPreset(**value)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return value
 
 
 @router.get("", response_model=list[ChannelOut])
@@ -47,6 +64,7 @@ def create_channel(payload: ChannelCreate, db: Session = Depends(get_db)) -> Cha
         max_clips_per_video=payload.max_clips_per_video,
         min_score=payload.min_score,
         language=payload.language,
+        render_preset=_validated_render_preset(payload.render_preset),
     )
     db.add(channel)
     db.flush()
@@ -59,7 +77,10 @@ def update_channel(channel_id: int, payload: ChannelUpdate, db: Session = Depend
     channel = db.get(Channel, channel_id)
     if channel is None:
         raise HTTPException(status_code=404, detail="Channel not found")
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    updates = payload.model_dump(exclude_unset=True)
+    if "render_preset" in updates:
+        updates["render_preset"] = _validated_render_preset(updates["render_preset"])
+    for field, value in updates.items():
         setattr(channel, field, value)
     db.flush()
     db.refresh(channel)
@@ -154,11 +175,7 @@ def channel_import(
 
     if needs_enqueue:
         job_payload: dict = {"video_id": video.id}
-        overrides: dict = {}
-        if payload.max_clips is not None:
-            overrides["max_clips"] = payload.max_clips
-        if payload.min_score is not None:
-            overrides["min_score"] = payload.min_score
+        overrides = analysis_overrides(payload.max_clips, payload.min_score, payload.language)
         if overrides:
             job_payload["analysis_overrides"] = overrides
         enqueue(db, JobType.FETCH_TRANSCRIPT, job_payload)

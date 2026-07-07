@@ -4,23 +4,27 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from clipfactory.api.deps import get_db
 from clipfactory.api.schemas import PostOut
-from clipfactory.models import JobType, Post, PostStatus
+from clipfactory.models import JobType, Post, PostStatus, Route
 
 router = APIRouter(prefix="/api/posts", tags=["posts"])
 
 
 def _to_out(post: Post) -> PostOut:
-    account = post.route.account
+    # `target_account` resolves via whichever of route/account is set; it can
+    # still be None if the account was deleted out from under an existing post
+    # (normally cascading deletes remove the post too, but don't crash if not).
+    account = post.target_account
     return PostOut(
         id=post.id,
         clip_id=post.clip_id,
         route_id=post.route_id,
-        account_platform=account.platform,
-        account_name=account.name,
+        account_id=post.account_id,
+        account_platform=account.platform if account else None,
+        account_name=account.name if account else "—",
         status=post.status,
         external_id=post.external_id,
         external_url=post.external_url,
@@ -37,11 +41,11 @@ def list_posts(
     limit: int = Query(default=50, le=500),
     db: Session = Depends(get_db),
 ) -> list[PostOut]:
-    stmt = select(Post)
+    stmt = select(Post).options(joinedload(Post.route).joinedload(Route.account), joinedload(Post.account))
     if status is not None:
         stmt = stmt.where(Post.status == status)
     stmt = stmt.order_by(Post.created_at.desc()).limit(limit)
-    posts = list(db.scalars(stmt))
+    posts = list(db.scalars(stmt).unique())
     return [_to_out(p) for p in posts]
 
 
@@ -55,6 +59,7 @@ def retry(post_id: int, db: Session = Depends(get_db)) -> PostOut:
 
     post.status = PostStatus.PENDING
     post.error = ""
+    post.attempts = 0
 
     from clipfactory.pipeline.queue import enqueue
 

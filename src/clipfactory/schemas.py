@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class TranscriptSegment(BaseModel):
@@ -61,6 +61,8 @@ class Moment(BaseModel):
 
 class RenderPreset(BaseModel):
     """How to turn a source fragment into a vertical clip (module: media)."""
+
+    model_config = ConfigDict(extra="forbid")
 
     width: int = 1080
     height: int = 1920

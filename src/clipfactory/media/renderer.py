@@ -17,8 +17,22 @@ class RenderError(RuntimeError):
 
 
 def escape_filter_path(path: str) -> str:
-    """Escape a filesystem path for use as an ffmpeg filter argument (e.g. `ass=...`)."""
-    return path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+    """Escape a filesystem path for use as an ffmpeg filter argument (e.g. `ass=...`).
+
+    Backslash must be escaped first so the escapes added for the other
+    metacharacters aren't themselves re-escaped. `,` and `;` are filtergraph
+    separators and `[`/`]` delimit link labels, so any of them appearing in a
+    path (e.g. `clip [final].ass`) would otherwise corrupt the filtergraph.
+    """
+    return (
+        path.replace("\\", "\\\\")
+        .replace(":", "\\:")
+        .replace("'", "\\'")
+        .replace(",", "\\,")
+        .replace(";", "\\;")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+    )
 
 
 def build_ffmpeg_command(

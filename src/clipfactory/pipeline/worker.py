@@ -51,6 +51,15 @@ def run_worker(stop_event: threading.Event, poll_interval: float | None = None) 
     from clipfactory.config import get_settings
 
     interval = poll_interval if poll_interval is not None else get_settings().worker_poll_sec
+
+    # Recover jobs a previous worker process left RUNNING when it crashed
+    # (or was killed) mid-handler -- claim_next never re-selects RUNNING
+    # jobs, so without this they'd be stuck forever.
+    with session_scope() as session:
+        requeued = queue.requeue_stale_running(session)
+    if requeued:
+        logger.info("worker: requeued %d stale RUNNING job(s) on startup", requeued)
+
     logger.info("worker: starting (poll_interval=%.1fs)", interval)
 
     while not stop_event.is_set():

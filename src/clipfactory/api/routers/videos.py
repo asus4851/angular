@@ -7,7 +7,13 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from clipfactory.api.deps import get_db
-from clipfactory.api.schemas import VideoAnalyzeRequest, VideoImportOut, VideoImportRequest, VideoOut
+from clipfactory.api.schemas import (
+    VideoAnalyzeRequest,
+    VideoImportOut,
+    VideoImportRequest,
+    VideoOut,
+    analysis_overrides,
+)
 from clipfactory.models import Channel, ClipCandidate, Video, VideoStatus
 
 router = APIRouter(prefix="/api/videos", tags=["videos"])
@@ -56,20 +62,12 @@ def list_videos(
     return result
 
 
-def _overrides_from(max_clips: int | None, min_score: int | None, language: str | None) -> dict:
-    overrides: dict = {}
-    if max_clips is not None:
-        overrides["max_clips"] = max_clips
-    if min_score is not None:
-        overrides["min_score"] = min_score
-    if language is not None:
-        overrides["language"] = language
-    return overrides
-
-
 @router.post("", response_model=VideoImportOut)
 def import_video(payload: VideoImportRequest, response: Response, db: Session = Depends(get_db)) -> VideoImportOut:
-    from clipfactory.ingest.youtube import IngestError, fetch_video_info
+    from clipfactory.ingest.youtube import IngestError, fetch_video_info, parse_video_id
+
+    if parse_video_id(payload.url) is None:
+        raise HTTPException(status_code=422, detail="Не схоже на посилання на YouTube-відео")
 
     try:
         video_info, channel_info = fetch_video_info(payload.url)
@@ -105,7 +103,7 @@ def import_video(payload: VideoImportRequest, response: Response, db: Session = 
         from clipfactory.pipeline.queue import enqueue
 
         job_payload: dict = {"video_id": video.id}
-        overrides = _overrides_from(payload.max_clips, payload.min_score, payload.language)
+        overrides = analysis_overrides(payload.max_clips, payload.min_score, payload.language)
         if overrides:
             job_payload["analysis_overrides"] = overrides
         enqueue(db, JobType.FETCH_TRANSCRIPT, job_payload)
@@ -140,7 +138,7 @@ def analyze_video(
 
     payload = payload or VideoAnalyzeRequest()
     job_payload: dict = {"video_id": video.id}
-    overrides = _overrides_from(payload.max_clips, payload.min_score, payload.language)
+    overrides = analysis_overrides(payload.max_clips, payload.min_score, payload.language)
     if overrides:
         job_payload["overrides"] = overrides
     enqueue(db, JobType.ANALYZE_VIDEO, job_payload)

@@ -7,10 +7,10 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from clipfactory.api.deps import get_db
-from clipfactory.api.schemas import StatsOut
+from clipfactory.api.schemas import FailedJobOut, StatsOut
 from clipfactory.models import (
     Account,
     Channel,
@@ -128,20 +128,47 @@ def moderation_page(request: Request, db: Session = Depends(get_db)):
         )
     )
     accounts = list(db.scalars(select(Account).where(Account.enabled.is_(True)).order_by(Account.name)))
-    rendered_clips = list(
-        db.scalars(select(Clip).where(Clip.status == ClipStatus.RENDERED).order_by(Clip.rendered_at.desc()))
+    # ~Clip.posts.any() picks out rendered clips with zero posts directly in
+    # SQL instead of loading every rendered clip and filtering in Python.
+    unpublished_clips = list(
+        db.scalars(
+            select(Clip)
+            .where(Clip.status == ClipStatus.RENDERED, ~Clip.posts.any())
+            .options(joinedload(Clip.candidate))
+            .order_by(Clip.rendered_at.desc())
+            .limit(50)
+        )
     )
-    unpublished_clips = [c for c in rendered_clips if not c.posts]
+    failed_clips = list(
+        db.scalars(
+            select(Clip)
+            .where(Clip.status == ClipStatus.FAILED)
+            .options(joinedload(Clip.candidate))
+            .order_by(Clip.created_at.desc())
+            .limit(50)
+        )
+    )
     return templates.TemplateResponse(
         request,
         "moderation.html",
-        {"candidates": candidates, "accounts": accounts, "unpublished_clips": unpublished_clips},
+        {
+            "candidates": candidates,
+            "accounts": accounts,
+            "unpublished_clips": unpublished_clips,
+            "failed_clips": failed_clips,
+        },
     )
 
 
 @pages_router.get("/posts")
 def posts_page(request: Request, db: Session = Depends(get_db)):
-    posts = list(db.scalars(select(Post).order_by(Post.created_at.desc())))
+    stmt = (
+        select(Post)
+        .options(joinedload(Post.route).joinedload(Route.account), joinedload(Post.account))
+        .order_by(Post.created_at.desc())
+        .limit(200)
+    )
+    posts = list(db.scalars(stmt).unique())
     return templates.TemplateResponse(request, "posts.html", {"posts": posts})
 
 
@@ -158,9 +185,7 @@ def stats(db: Session = Depends(get_db)) -> StatsOut:
         clips=_counts_by_status(db, Clip, Clip.status),
         posts=_counts_by_status(db, Post, Post.status),
         jobs=_counts_by_status(db, Job, Job.status),
-        recent_failed_jobs=[
-            {"type": j.type.value, "error": j.last_error, "run_at": j.run_at.isoformat()} for j in failed_jobs
-        ],
+        recent_failed_jobs=[FailedJobOut(type=j.type, error=j.last_error, run_at=j.run_at) for j in failed_jobs],
     )
 
 

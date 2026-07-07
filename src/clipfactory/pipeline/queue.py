@@ -97,3 +97,26 @@ def fail(session: Session, job: Job, error: str) -> None:
     else:
         job.status = JobStatus.FAILED
     session.add(job)
+
+
+def requeue_stale_running(session: Session, older_than_min: int = 30) -> int:
+    """Requeue RUNNING jobs stuck since a crash (process killed mid-handler).
+
+    `claim_next` only ever selects QUEUED jobs, so a job left RUNNING by a
+    worker that died before completing/failing it would otherwise wedge its
+    payload forever -- nothing re-claims it, and `enqueue`'s dedupe treats
+    RUNNING as "already in flight" so a fresh enqueue of the same work is
+    suppressed too. A job legitimately RUNNING for `older_than_min` minutes
+    without its `updated_at` advancing is assumed dead.
+    """
+    threshold = utcnow() - timedelta(minutes=older_than_min)
+    stale_jobs = (
+        session.query(Job).filter(Job.status == JobStatus.RUNNING, Job.updated_at < threshold).all()
+    )
+    now = utcnow()
+    for job in stale_jobs:
+        job.status = JobStatus.QUEUED
+        job.run_at = now
+    if stale_jobs:
+        logger.info("requeue_stale_running: requeued %d stale RUNNING job(s)", len(stale_jobs))
+    return len(stale_jobs)

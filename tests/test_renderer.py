@@ -75,6 +75,16 @@ def test_escape_filter_path_escapes_colon_backslash_quote():
     assert escaped == r"C\:\\videos\\it\'s here.ass"
 
 
+def test_escape_filter_path_escapes_comma_semicolon_brackets():
+    raw = "C:/clips/clip [final], v2; done.ass"
+    escaped = escape_filter_path(raw)
+    assert escaped == r"C\:/clips/clip \[final\]\, v2\; done.ass"
+    assert "," not in escaped.replace("\\,", "")
+    assert ";" not in escaped.replace("\\;", "")
+    assert "[" not in escaped.replace("\\[", "")
+    assert "]" not in escaped.replace("\\]", "")
+
+
 def test_unsupported_mode_raises():
     from clipfactory.media.renderer import RenderError
 
